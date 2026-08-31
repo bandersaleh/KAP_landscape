@@ -1,0 +1,86 @@
+Transmittal Report:
+Created by AutoCAD LT eTransmit martes, 12 de septiembre de 2023, 12:54.
+
+Drawing:
+This is a transmittal based on JVEA-GRP-MON-HSC-5020-5021.dwg.
+
+Files:
+
+Root Drawing:
+	JVEA-GRP-MON-HSC-5020-5021.dwg
+
+AutoCAD LT Drawing (External) References:
+	Xref\XREF_MON_TITLE BLOCK.dwg
+	03-Paviments\XREF_PAV DETAILS TABLE.dwg
+	03-Paviments\XREF_PAVEMENTS DESIGN PALETTE.dwg
+	Xref\XREF_MON_HSC_PAVEMENT_50.dwg
+	Xref\XREF_MON_GENERAL_LAYOUT.dwg
+	Xref\XREF_MON_SFT_SIDEWALK VEGETATION.dwg
+	Xref\XREF_MON_SFT_TREES.dwg
+	Xref\XREF_HSC_ARC_CONSTRUCTION NOTES.dwg
+	Xref\XREF_MON_HSC_PAVEMENT.dwg
+
+AutoCAD LT Color-dependent Plot Style Table File References:
+	PlotCfgs\tie-tipus_Riadh_250.ctb
+	PlotCfgs\tie-tipus.ctb
+
+AutoCAD LT Plotter Configuration File References:
+	PlotCfgs\DWG To PDF.pc3
+
+Archivo JPG References:
+	2-Mineral Peça\2llosavulcano60x40x5_desierto.jpg
+	Sealed Graved\Breedons-Self-Binding-Gravel.jpg
+	Natural Stone\Cobblestone-Ebony-with-Meadow-on-the-border.jpg
+	7-Gespa\Césped calor.jpg
+	Natural Stone\IMG-3585.jpg
+	1-Mineral Continuo\IMG_0131.JPG
+	1-Mineral Continuo\IMG_6803.JPG
+	4-Mixt\Kodolé Morter2.jpg
+	4-Mixt\Kodolé VERD.jpg
+	4-Mixt\Kodolé22.jpg
+	2-Mineral Peça\llosavulcano60x40x5_arena.jpg
+	5-Terra Consolidada\road-structure-compacted.jpg
+	Natural Stone\vddc.jpg
+
+Archivo PNG References:
+	2-Mineral Peça\llosavulcano60x40x5_marfil.png
+	2-Mineral Peça\Tegula_arena.png
+	2-Mineral Peça\Tegula_desierto.png
+	2-Mineral Peça\Tegula_marfil.png
+
+The following files were excluded from the transmittal:
+	acadlt.fmp
+	Fonts\simplex.shx
+	Fonts\arial.ttf
+	Fonts\txt.shx
+	Fonts\TT0586M.TTF
+	Fonts\verdana.ttf
+	Fonts\ltypeshp.shx
+	Fonts\romans.shx
+	Fonts\ARIALN.TTF
+	Fonts\swiss.ttf
+	Fonts\romantic.ttf
+
+The following files could not be located:
+	batlleiroig-BIR-512-cobriment-ferrocarril-vilafranca-©JordiSurroca-08-1536x15362.jpg
+
+
+Notes for distribution:
+
+.DWG external reference files:
+External reference (xref) paths may be present.  Make sure these paths work or that the root drawing is using the correct references.
+eTransmit does not include files required by xrefs unless they are also required by the root drawing.  In particular, plot style tables and overlay xrefs that are not used by the root drawing are omitted
+
+Raster image files:
+Paths may be present on references to raster images.  Make sure these paths work or that the root drawing is using the correct references.
+
+.PC3 printer configuration files:
+Please copy these files to the AutoCAD LT Printer Configuration Search Path directory.
+
+.CTB/.STB plot style tables:
+Please copy these files to the AutoCAD LT Plot Style Table Search Path directory.
+
+The AutoCAD LT variable FONTALT was set to:
+C:\Users\usuari.GRUP\AppData\Roaming\Autodesk\AutoCAD LT 2022\R28\enu\Support\simplex.shx
+Please make sure that the FONTALT variable is set to this file or an equivalent before opening any drawings.  All text styles with missing fonts are automatically set to this font.
+
