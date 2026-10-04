@@ -1,0 +1,2732 @@
+// If this file gets updated, run powershell command: docker compose --profile local run --rm --entrypoint corepack node pnpm run build
+import * as THREE from "three";
+export const THREE_PARK_LAYER_ID = "three-park-layer";
+function disposeThreeObject(object) {
+  if (!object || typeof object.traverse !== "function") return;
+  object.traverse((child) => {
+    if (child.geometry && typeof child.geometry.dispose === "function") {
+      child.geometry.dispose();
+    }
+    if (Array.isArray(child.material)) {
+      child.material.forEach((material) => {
+        if (material && typeof material.dispose === "function") {
+          material.dispose();
+        }
+      });
+    } else if (child.material && typeof child.material.dispose === "function") {
+      child.material.dispose();
+    }
+  });
+}
+/**
+ * Build horizontal stair treads and vertical risers from parallel stair-edge
+ * LineString features exported from AutoCAD. The source linework stores XY only;
+ * terrain height establishes the staircase direction and the CAD layer provides
+ * a 10 cm nominal step height.
+ */
+export function createStairTreadGroup({
+  records = [],
+  THREE: ThreeRef = THREE,
+  material = null,
+  lineMaterial = null,
+  toLocal,
+  getTerrainHeight,
+  clearance = 0.08,
+  // Optional vertical support lift used for the two staircase landings.
+  // Map.vue passes the Pedestrian Space clearance so the top tread meets the
+  // visible walking-path surface rather than the raw Terrain (After) plane.
+  surfaceClearance = null,
+  defaultStepHeight = 0.1,
+  // Optional project-specific CAD design resolver. It receives the reconstructed
+  // tread count/depth plus terrain endpoints and may return an authoritative
+  // riser height in metres. When omitted, the original generic behaviour is kept.
+  resolveStepHeight = null,
+  // Opt-in project-specific reconstruction controls.
+  preferHighestTopLanding = false,
+  suppressSplitSectionTopExtensions = false,
+  // Keep every lateral section of one split wide staircase on one shared
+  // vertical step ladder. Without this, each section samples a different part
+  // of a sloping Terrain surface and the same CAD tread can be rendered at
+  // several unrelated heights, producing tall walls between adjacent sections.
+  synchronizeSplitSectionElevations = false,
+  // When true, do not invent the extra final/top tread rectangle that is not
+  // present in the source CAD. Muanisiyah has adjacent stair flights of
+  // different lengths with a water channel between them; those synthetic top
+  // rectangles are the two wide white slabs seen crossing the cascade.
+  suppressSyntheticTopTreads = false,
+  outlineLift = 0.065,
+  // Profile-only mode is used by Map.vue before the terrain/path materials are
+  // created. It runs the EXACT same stair reconstruction but does not allocate
+  // visible meshes. The returned userData mask profiles therefore match the
+  // staircase that will actually render later.
+  maskOnly = false,
+  // Exact Terrain (After) cut-out profiles that Map.vue actually activates in
+  // the shader. Visible handrails are allowed only when their reconstructed
+  // stair run matches one of these profiles. This prevents stair-like CAD
+  // groups (for example water-feature terraces) from receiving rails when
+  // Terrain (After) is not actually cut out for that group.
+  activeTerrainCutoutProfiles = null,
+  // Optional authoritative WATER polygons. Small stair-edge clusters that cut
+  // through the middle of one of these polygons are not pedestrian stairs; in
+  // Muanisiyah they are water-feature/cascade reference linework. Suppressing
+  // them here prevents createThreeParkLayer from inventing a perpendicular
+  // staircase while leaving genuine short stairs elsewhere untouched.
+  stairExclusionFeatures = [],
+  // Muanisiyah: carve authoritative Water polygons out of generated stair
+  // surfaces. The CAD has separate left/right stair flights with a narrow
+  // cascade channel between them. Older reconstruction merged collinear
+  // partial stair edges into one envelope and could bridge that channel.
+  clipTreadsAgainstExclusion = false,
+  // Muanisiyah connector-stair reconciliation. Some real three-step flights sit
+  // perpendicular to the top of a much taller staircase. Terrain sampling alone
+  // can solve those short flights against the old TIN height, while Map.vue raises
+  // the shared Pedestrian Space to the tall staircase's true upper landing. When
+  // enabled, snap only those nearby three-step connector flights to the tall
+  // landing and redistribute their three risers so the stair remains stepped
+  // instead of forcing the Pedestrian Space into a steep ramp.
+  reconcileShortConnectorStairs = false,
+} = {}) {
+  const group = new ThreeRef.Group();
+  group.name = "three-stair-treads";
+  if (typeof toLocal !== "function" || typeof getTerrainHeight !== "function") {
+    return group;
+  }
+  const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+  const degToRad = (degrees) => ThreeRef.MathUtils.degToRad(degrees);
+  // Convert authoritative Water polygons into local X/Z rings once. These are
+  // used ONLY as a rejection test for small stair clusters. They never create
+  // geometry and never modify the Water layer.
+  const exclusionPolygons = [];
+  const pushExclusionPolygon = (rings) => {
+    if (!Array.isArray(rings) || !Array.isArray(rings[0])) return;
+    const localRings = rings
+      .map((ring) =>
+        (Array.isArray(ring) ? ring : [])
+          .map((coordinate) => toLocal(coordinate))
+          .filter(
+            (point) =>
+              point &&
+              Number.isFinite(Number(point.x)) &&
+              Number.isFinite(Number(point.z)),
+          ),
+      )
+      .filter((ring) => ring.length >= 3);
+    if (localRings.length) exclusionPolygons.push(localRings);
+  };
+  (Array.isArray(stairExclusionFeatures) ? stairExclusionFeatures : []).forEach(
+    (feature) => {
+      const geometry = feature && feature.geometry;
+      if (!geometry) return;
+      if (geometry.type === "Polygon") {
+        pushExclusionPolygon(geometry.coordinates);
+      } else if (geometry.type === "MultiPolygon") {
+        (Array.isArray(geometry.coordinates)
+          ? geometry.coordinates
+          : []
+        ).forEach((polygon) => pushExclusionPolygon(polygon));
+      }
+    },
+  );
+  const pointInRingXZ = (point, ring) => {
+    if (!point || !Array.isArray(ring) || ring.length < 3) return false;
+    let inside = false;
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      const xi = Number(ring[i].x);
+      const zi = Number(ring[i].z);
+      const xj = Number(ring[j].x);
+      const zj = Number(ring[j].z);
+      const intersects =
+        zi > point.z !== zj > point.z &&
+        point.x < ((xj - xi) * (point.z - zi)) / (zj - zi || 1e-12) + xi;
+      if (intersects) inside = !inside;
+    }
+    return inside;
+  };
+  const pointInPolygonXZ = (point, polygonRings) => {
+    if (!Array.isArray(polygonRings) || !polygonRings.length) return false;
+    if (!pointInRingXZ(point, polygonRings[0])) return false;
+    // Interior rings are holes.
+    for (let index = 1; index < polygonRings.length; index += 1) {
+      if (pointInRingXZ(point, polygonRings[index])) return false;
+    }
+    return true;
+  };
+  const orientationXZ = (a, b, c) =>
+    (Number(b.z) - Number(a.z)) * (Number(c.x) - Number(b.x)) -
+    (Number(b.x) - Number(a.x)) * (Number(c.z) - Number(b.z));
+  const segmentsIntersectXZ = (a, b, c, d) => {
+    const o1 = orientationXZ(a, b, c);
+    const o2 = orientationXZ(a, b, d);
+    const o3 = orientationXZ(c, d, a);
+    const o4 = orientationXZ(c, d, b);
+    return o1 > 0 !== o2 > 0 && o3 > 0 !== o4 > 0;
+  };
+  const segmentIntersectsExclusion = (segment) => {
+    if (!segment || !exclusionPolygons.length) return false;
+    const midpoint = segment.midpoint || {
+      x: (Number(segment.a.x) + Number(segment.b.x)) / 2,
+      z: (Number(segment.a.z) + Number(segment.b.z)) / 2,
+    };
+    return exclusionPolygons.some((polygonRings) => {
+      if (
+        pointInPolygonXZ(segment.a, polygonRings) ||
+        pointInPolygonXZ(segment.b, polygonRings) ||
+        pointInPolygonXZ(midpoint, polygonRings)
+      ) {
+        return true;
+      }
+      const outer = polygonRings[0] || [];
+      for (let index = 0; index < outer.length; index += 1) {
+        const c = outer[index];
+        const d = outer[(index + 1) % outer.length];
+        if (segmentsIntersectXZ(segment.a, segment.b, c, d)) return true;
+      }
+      return false;
+    });
+  };
+  const getVisibleAlongIntervals = (
+    alongStart,
+    alongEnd,
+    normalStart,
+    normalEnd,
+    ux,
+    uz,
+    nx,
+    nz,
+  ) => {
+    const minAlong = Math.min(Number(alongStart), Number(alongEnd));
+    const maxAlong = Math.max(Number(alongStart), Number(alongEnd));
+    if (
+      !clipTreadsAgainstExclusion ||
+      !exclusionPolygons.length ||
+      ![minAlong, maxAlong, normalStart, normalEnd].every(Number.isFinite) ||
+      maxAlong - minAlong < 0.02
+    ) {
+      return [{ alongStart: minAlong, alongEnd: maxAlong }];
+    }
+    const middleNormal =
+      (Number(normalStart) + Number(normalEnd)) * 0.5;
+    const isExcludedAtAlong = (along) => {
+      const point = {
+        x: ux * along + nx * middleNormal,
+        z: uz * along + nz * middleNormal,
+      };
+      return exclusionPolygons.some((polygonRings) =>
+        pointInPolygonXZ(point, polygonRings),
+      );
+    };
+    // 5 cm scan is enough to preserve the narrow central cascade gap without
+    // adding meaningful load compared with the full 3D build.
+    const span = maxAlong - minAlong;
+    const sampleCount = Math.max(
+      1,
+      Math.min(800, Math.ceil(span / 0.05)),
+    );
+    const intervals = [];
+    let openStart = null;
+    for (let index = 0; index < sampleCount; index += 1) {
+      const a0 = minAlong + (span * index) / sampleCount;
+      const a1 = minAlong + (span * (index + 1)) / sampleCount;
+      const mid = (a0 + a1) * 0.5;
+      const excluded = isExcludedAtAlong(mid);
+      if (!excluded) {
+        if (openStart === null) openStart = a0;
+      } else if (openStart !== null) {
+        if (a0 - openStart >= 0.055) {
+          intervals.push({ alongStart: openStart, alongEnd: a0 });
+        }
+        openStart = null;
+      }
+    }
+    if (openStart !== null && maxAlong - openStart >= 0.055) {
+      intervals.push({ alongStart: openStart, alongEnd: maxAlong });
+    }
+    // If the exclusion only grazes the edge and numerical sampling would erase
+    // the whole tread, keep the original source span.
+    return intervals.length
+      ? intervals
+      : [{ alongStart: minAlong, alongEnd: maxAlong }];
+  };
+  const canonicalize = (a, b) => {
+    const dx = Number(b.x) - Number(a.x);
+    const dz = Number(b.z) - Number(a.z);
+    const length = Math.hypot(dx, dz);
+    if (!Number.isFinite(length) || length < 0.08) return null;
+    let ux = dx / length;
+    let uz = dz / length;
+    let start = { x: Number(a.x), z: Number(a.z) };
+    let end = { x: Number(b.x), z: Number(b.z) };
+    if (ux < -1e-6 || (Math.abs(ux) <= 1e-6 && uz < 0)) {
+      ux *= -1;
+      uz *= -1;
+      const swap = start;
+      start = end;
+      end = swap;
+    }
+    return {
+      a: start,
+      b: end,
+      ux,
+      uz,
+      length,
+      midpoint: {
+        x: (start.x + end.x) / 2,
+        z: (start.z + end.z) / 2,
+      },
+    };
+  };
+  // Read BOTH stair layers. The +10 cm and -10 cm lines describe the same
+  // stair systems from opposite edge conventions; using both is important for
+  // the smaller Munisiyah staircases that may have only one +10 cm record.
+  const segments = [];
+  records.forEach((record) => {
+    const feature = record && record.feature;
+    const geometry = feature && feature.geometry;
+    const properties = (feature && feature.properties) || {};
+    const lineSets =
+      geometry && geometry.type === "LineString"
+        ? [geometry.coordinates]
+        : geometry && geometry.type === "MultiLineString"
+          ? geometry.coordinates
+          : [];
+    const cadLayer = String(properties.cad_layer || "");
+    const explicitDelta = Number(properties.step_delta_cm);
+    const nominalStepHeight = clamp(
+      Math.abs(
+        Number.isFinite(explicitDelta) && explicitDelta !== 0
+          ? explicitDelta / 100
+          : defaultStepHeight,
+      ),
+      0.06,
+      0.22,
+    );
+    lineSets.forEach((line) => {
+      if (!Array.isArray(line)) return;
+      for (let index = 0; index < line.length - 1; index += 1) {
+        const start = toLocal(line[index]);
+        const end = toLocal(line[index + 1]);
+        if (!start || !end) continue;
+        const normalized = canonicalize(start, end);
+        if (!normalized) continue;
+        // Preserve the complete CAD stair edge, including very large landscape
+        // staircases. Do not reject a segment just because it is long: Munisiyah
+        // contains genuine broad stair/terrace edges longer than the old 70 m cap.
+        segments.push({
+          ...normalized,
+          cadLayer,
+          nominalStepHeight,
+          isPositiveEdge: /\+10cm/i.test(cadLayer),
+          isNegativeEdge: /-10cm/i.test(cadLayer),
+        });
+      }
+    });
+  });
+  if (segments.length < 2) return group;
+  const angleDifference = (one, two) => {
+    const dot = clamp(one.ux * two.ux + one.uz * two.uz, -1, 1);
+    return Math.acos(Math.abs(dot));
+  };
+  // Group nearby parallel records into separate stair systems. The previous
+  // implementation required centers to be within 2.25 m, which was too strict
+  // for the broad terraced stairs visible in the Munisiyah design/construction.
+  const adjacency = segments.map(() => []);
+  for (let i = 0; i < segments.length; i += 1) {
+    for (let j = i + 1; j < segments.length; j += 1) {
+      const one = segments[i];
+      const two = segments[j];
+      if (angleDifference(one, two) > degToRad(14)) continue;
+      const dx = two.midpoint.x - one.midpoint.x;
+      const dz = two.midpoint.z - one.midpoint.z;
+      const centerDistance = Math.hypot(dx, dz);
+      // Large/partial stair edges can have distant midpoints even when they are
+      // members of the same staircase. Scale the search radius with edge length
+      // instead of imposing the old fixed 15 m compression/filter.
+      const clusterSearchRadius = Math.max(
+        18,
+        Math.min(90, Math.max(one.length, two.length) * 1.15),
+      );
+      if (centerDistance > clusterSearchRadius) continue;
+      const normalX = -one.uz;
+      const normalZ = one.ux;
+      const normalShift = Math.abs(dx * normalX + dz * normalZ);
+      const parallelShift = Math.abs(dx * one.ux + dz * one.uz);
+      // Adjacent tread edges mainly move perpendicular to themselves. Allow a
+      // wider parallel tolerance because several CAD stair lines are partial.
+      // Preserve broad landscape stair systems and large intermediate landings.
+      // The along-axis test is based on the actual projected intervals so partial
+      // CAD lines can connect without allowing arbitrary parallel objects to join.
+      const oneAlongMin = Math.min(
+        one.a.x * one.ux + one.a.z * one.uz,
+        one.b.x * one.ux + one.b.z * one.uz,
+      );
+      const oneAlongMax = Math.max(
+        one.a.x * one.ux + one.a.z * one.uz,
+        one.b.x * one.ux + one.b.z * one.uz,
+      );
+      const twoAlongMin = Math.min(
+        two.a.x * one.ux + two.a.z * one.uz,
+        two.b.x * one.ux + two.b.z * one.uz,
+      );
+      const twoAlongMax = Math.max(
+        two.a.x * one.ux + two.a.z * one.uz,
+        two.b.x * one.ux + two.b.z * one.uz,
+      );
+      const alongGap = Math.max(
+        0,
+        Math.max(oneAlongMin, twoAlongMin) - Math.min(oneAlongMax, twoAlongMax),
+      );
+      // Separate nearby parallel staircases. The old 18 m normal tolerance
+      // could chain several independent Qadisiyah stair systems together, making
+      // one reconstructed stair surface sit on top of another.
+      if (normalShift > 5.5) continue;
+      if (alongGap > Math.max(3.0, 0.12 * Math.max(one.length, two.length))) {
+        continue;
+      }
+      adjacency[i].push(j);
+      adjacency[j].push(i);
+    }
+  }
+  const visited = new Set();
+  const spatialClusters = [];
+  const clusteredSegmentIds = new Set();
+  const renderedSegmentIds = new Set();
+  const suppressedSegmentIds = new Set();
+  for (let startIndex = 0; startIndex < segments.length; startIndex += 1) {
+    if (visited.has(startIndex)) continue;
+    const stack = [startIndex];
+    const ids = [];
+    visited.add(startIndex);
+    while (stack.length) {
+      const id = stack.pop();
+      ids.push(id);
+      adjacency[id].forEach((next) => {
+        if (visited.has(next)) return;
+        visited.add(next);
+        stack.push(next);
+      });
+    }
+    if (ids.length >= 2) {
+      ids.forEach((id) => clusteredSegmentIds.add(id));
+      spatialClusters.push(ids.map((id) => segments[id]));
+    }
+  }
+  const positions = [];
+  const outlines = [];
+  // Simple skate-spot-style stair handrails: one straight sloping top tube with
+  // sparse vertical supports. Deliberately no fence-like intermediate rails.
+  const handrailSegments = [];
+  const pushHandrailSegment = (a, b, radius = 0.03) => {
+    if (!a || !b) return;
+    const length = Math.hypot(
+      Number(b.x) - Number(a.x),
+      Number(b.y) - Number(a.y),
+      Number(b.z) - Number(a.z),
+    );
+    if (!Number.isFinite(length) || length < 0.03) return;
+    handrailSegments.push({ a, b, radius });
+  };
+  // These profiles are generated from the SAME tread pairs that are actually
+  // rendered below. Terrain (After) and Pedestrian Space use them as cutouts.
+  // This replaces the old second/independent staircase clustering pass, which
+  // could mask the wrong place or miss part of a real staircase.
+  const renderedMaskProfiles = [];
+  const activeCutoutProfiles = Array.isArray(activeTerrainCutoutProfiles)
+    ? activeTerrainCutoutProfiles
+    : [];
+  // The mask-only pre-pass and the visible stair pass run the same reconstruction
+  // algorithm. Match by the actual oriented cut-out rectangle rather than by a
+  // loose CAD cluster id, so a visible handrail can exist only where Terrain
+  // (After) is genuinely being discarded by the shader.
+  const matchesActiveTerrainCutout = (profile) => {
+    if (!profile || !activeCutoutProfiles.length) return false;
+    const keys = [
+      "ux",
+      "uz",
+      "nx",
+      "nz",
+      "cutoutAlongMin",
+      "cutoutAlongMax",
+      "cutoutNormalMin",
+      "cutoutNormalMax",
+    ];
+    return activeCutoutProfiles.some((active) => {
+      if (!active) return false;
+      if (
+        Number.isFinite(Number(profile.sectionId)) &&
+        Number.isFinite(Number(active.sectionId)) &&
+        Number(profile.sectionId) !== Number(active.sectionId)
+      ) {
+        return false;
+      }
+      return keys.every((key) => {
+        const a = Number(profile[key]);
+        const b = Number(active[key]);
+        if (!Number.isFinite(a) || !Number.isFinite(b)) return false;
+        // Same helper + same local origin normally yields bit-identical values.
+        // Keep a tiny tolerance for harmless floating-point differences.
+        return Math.abs(a - b) <= 0.002;
+      });
+    });
+  };
+  const pushTri = (p1, p2, p3) => {
+    positions.push(p1.x, p1.y, p1.z, p2.x, p2.y, p2.z, p3.x, p3.y, p3.z);
+  };
+  const pushLine = (p1, p2, lift = Math.max(outlineLift, 0.012)) => {
+    outlines.push(p1.x, p1.y + lift, p1.z, p2.x, p2.y + lift, p2.z);
+  };
+  let staircaseCount = 0;
+  let treadCount = 0;
+  spatialClusters.forEach((cluster) => {
+    // Muanisiyah-specific false-stair guard: the bound CAD contains several
+    // compact 6-7-edge groups crossing THROUGH the middle of the long Water
+    // Feature polygons. Those edges describe the water/cascade detail and must
+    // not be expanded into a pedestrian staircase. Genuine six-step stairs are
+    // preserved because they do not intersect an authoritative Water polygon;
+    // the large handrailed staircase is preserved because it is not a small
+    // cluster. This is deliberately narrow so other CAD stair systems are not
+    // removed.
+    const isSmallWaterCrossingCluster =
+      exclusionPolygons.length > 0 &&
+      cluster.length <= 9 &&
+      cluster.some((segment) => segmentIntersectsExclusion(segment));
+    if (isSmallWaterCrossingCluster) {
+      cluster.forEach((segment) => {
+        const segmentId = segments.indexOf(segment);
+        if (segmentId >= 0) suppressedSegmentIds.add(segmentId);
+      });
+      return;
+    }
+    // Robust dominant orientation. Using doubled angles removes the 180-degree
+    // ambiguity of line direction.
+    let cos2 = 0;
+    let sin2 = 0;
+    cluster.forEach((segment) => {
+      const theta = Math.atan2(segment.uz, segment.ux);
+      cos2 += Math.cos(theta * 2) * segment.length;
+      sin2 += Math.sin(theta * 2) * segment.length;
+    });
+    const dominantTheta = Math.atan2(sin2, cos2) / 2;
+    let ux = Math.cos(dominantTheta);
+    let uz = Math.sin(dominantTheta);
+    if (ux < -1e-6 || (Math.abs(ux) <= 1e-6 && uz < 0)) {
+      ux *= -1;
+      uz *= -1;
+    }
+    const nx = -uz;
+    const nz = ux;
+    const projected = cluster
+      .filter((segment) => {
+        const dot = Math.abs(segment.ux * ux + segment.uz * uz);
+        return dot >= Math.cos(degToRad(16));
+      })
+      .map((segment) => {
+        const segmentId = segments.indexOf(segment);
+        const aAlong = segment.a.x * ux + segment.a.z * uz;
+        const bAlong = segment.b.x * ux + segment.b.z * uz;
+        return {
+          ...segment,
+          segmentId,
+          normal: segment.midpoint.x * nx + segment.midpoint.z * nz,
+          alongMin: Math.min(aAlong, bAlong),
+          alongMax: Math.max(aAlong, bAlong),
+        };
+      })
+      .sort((a, b) => a.normal - b.normal);
+    if (projected.length < 2) return;
+    // Merge partial / duplicate CAD segments that represent the same stair edge.
+    // +/-10 cm records often sit very close to one another and should contribute
+    // to one full-width tread edge instead of becoming separate tiny stairs.
+    const edgeBuckets = [];
+    projected.forEach((segment) => {
+      let bucket = edgeBuckets.find(
+        (candidate) => Math.abs(candidate.normal - segment.normal) <= 0.22,
+      );
+      if (!bucket) {
+        bucket = {
+          normal: segment.normal,
+          alongMin: segment.alongMin,
+          alongMax: segment.alongMax,
+          stepHeights: [],
+          segmentIds: new Set(),
+          positiveCount: 0,
+          negativeCount: 0,
+        };
+        edgeBuckets.push(bucket);
+      } else {
+        const weight = bucket.stepHeights.length + 1;
+        bucket.normal =
+          (bucket.normal * (weight - 1) + segment.normal) / weight;
+        bucket.alongMin = Math.min(bucket.alongMin, segment.alongMin);
+        bucket.alongMax = Math.max(bucket.alongMax, segment.alongMax);
+      }
+      bucket.stepHeights.push(segment.nominalStepHeight);
+      if (Number.isInteger(segment.segmentId) && segment.segmentId >= 0) {
+        bucket.segmentIds.add(segment.segmentId);
+      }
+      if (segment.isPositiveEdge) bucket.positiveCount += 1;
+      if (segment.isNegativeEdge) bucket.negativeCount += 1;
+    });
+    edgeBuckets.sort((a, b) => a.normal - b.normal);
+    // Separate genuinely different stair runs using the ACTUAL repeated tread
+    // spacing instead of the old fixed 12 m allowance. This is critical in dense
+    // Qadisiyah areas where several parallel staircases sit near each other.
+    const consecutiveGaps = [];
+    for (let gapIndex = 1; gapIndex < edgeBuckets.length; gapIndex += 1) {
+      const gap =
+        edgeBuckets[gapIndex].normal - edgeBuckets[gapIndex - 1].normal;
+      if (Number.isFinite(gap) && gap > 0.04) consecutiveGaps.push(gap);
+    }
+    const sortedRunGaps = consecutiveGaps.slice().sort((a, b) => a - b);
+    const representativeGap = sortedRunGaps.length
+      ? sortedRunGaps[
+          Math.min(
+            sortedRunGaps.length - 1,
+            Math.floor(sortedRunGaps.length * 0.45),
+          )
+        ]
+      : 0.4;
+    const runSplitThreshold = clamp(
+      Math.max(1.8, representativeGap * 4.5),
+      1.8,
+      5.5,
+    );
+    const runs = [];
+    let run = [edgeBuckets[0]];
+    for (let index = 1; index < edgeBuckets.length; index += 1) {
+      const gap = edgeBuckets[index].normal - edgeBuckets[index - 1].normal;
+      if (gap > runSplitThreshold) {
+        if (run.length >= 2) runs.push(run);
+        run = [];
+      }
+      run.push(edgeBuckets[index]);
+    }
+    if (run.length >= 2) runs.push(run);
+    runs.forEach((edges, stairRunIndex) => {
+      // Remove isolated sliver edges that overlap almost none of the staircase.
+      const widths = edges.map((edge) => edge.alongMax - edge.alongMin);
+      const sortedWidths = widths.slice().sort((a, b) => a - b);
+      const medianWidth =
+        sortedWidths[Math.floor(sortedWidths.length / 2)] || 1;
+      let usableEdges = edges.filter(
+        // Keep short partial CAD edges too. They can be the only surviving
+        // geometry for one end of a staircase and must not be compressed away.
+        (edge) =>
+          edge.alongMax - edge.alongMin >= Math.max(0.12, medianWidth * 0.035),
+      );
+      if (usableEdges.length < 2) return;
+      // Collect only footprints for tread surfaces that really get emitted.
+      // If a CAD pair is skipped because it does not overlap, it cannot create a
+      // terrain/path hole either. This is what makes Photos 2/3 match Photo 1.
+      const maskCells = [];
+      const edgeCenter = (edge, alongFraction = 0.5, normalOffset = 0) => {
+        const fraction = clamp(Number(alongFraction) || 0.5, 0, 1);
+        const along =
+          edge.alongMin + (edge.alongMax - edge.alongMin) * fraction;
+        return {
+          x: ux * along + nx * (edge.normal + normalOffset),
+          z: uz * along + nz * (edge.normal + normalOffset),
+        };
+      };
+      const medianFinite = (values) => {
+        const finite = values
+          .map(Number)
+          .filter(Number.isFinite)
+          .sort((a, b) => a - b);
+        if (!finite.length) return NaN;
+        const middle = Math.floor(finite.length / 2);
+        return finite.length % 2
+          ? finite[middle]
+          : (finite[middle - 1] + finite[middle]) / 2;
+      };
+      const maxFinite = (values) => {
+        const finite = values.map(Number).filter(Number.isFinite);
+        return finite.length ? Math.max(...finite) : NaN;
+      };
+      // Sample Terrain (After) across EVERY recovered CAD stair edge. A
+      // least-squares slope through all of those samples is much harder to flip
+      // accidentally than comparing only the first and last TIN triangles.
+      const terrainByEdge = usableEdges.map((edge) =>
+        medianFinite(
+          [0.12, 0.3, 0.5, 0.7, 0.88].map((fraction) =>
+            getTerrainHeight(edgeCenter(edge, fraction, 0)),
+          ),
+        ),
+      );
+      const regressionSamples = terrainByEdge
+        .map((height, index) => ({ index, height: Number(height) }))
+        .filter((sample) => Number.isFinite(sample.height));
+      let terrainSlopePerEdge = 0;
+      if (regressionSamples.length >= 2) {
+        const meanX =
+          regressionSamples.reduce((sum, sample) => sum + sample.index, 0) /
+          regressionSamples.length;
+        const meanY =
+          regressionSamples.reduce((sum, sample) => sum + sample.height, 0) /
+          regressionSamples.length;
+        let numerator = 0;
+        let denominator = 0;
+        regressionSamples.forEach((sample) => {
+          const dx = sample.index - meanX;
+          numerator += dx * (sample.height - meanY);
+          denominator += dx * dx;
+        });
+        if (denominator > 1e-9) {
+          terrainSlopePerEdge = numerator / denominator;
+        }
+      }
+      // Decide which end is uphill from the LANDINGS, not from the TIN under
+      // the stair treads. The Terrain (After) mesh can bridge across a staircase,
+      // so samples inside the run are not a reliable direction signal.
+      const normalGaps = [];
+      for (let i = 1; i < usableEdges.length; i += 1) {
+        const gap = Math.abs(usableEdges[i].normal - usableEdges[i - 1].normal);
+        if (Number.isFinite(gap) && gap > 0.02) normalGaps.push(gap);
+      }
+      normalGaps.sort((a, b) => a - b);
+      const medianGap = normalGaps.length
+        ? normalGaps[Math.floor(normalGaps.length / 2)]
+        : 0.35;
+      const sampleLanding = (edge, outwardSign) => {
+        // Sample several distances OUTSIDE the stair edge and several positions
+        // across its width. Median-of-medians rejects isolated bad TIN triangles.
+        const distances = [
+          clamp(medianGap * 0.8, 0.35, 1.4),
+          clamp(medianGap * 1.6, 0.7, 2.6),
+          clamp(medianGap * 2.5, 1.1, 4.0),
+        ];
+        const distanceMedians = distances
+          .map((distance) =>
+            medianFinite(
+              [0.12, 0.28, 0.5, 0.72, 0.88].map((fraction) =>
+                getTerrainHeight(
+                  edgeCenter(edge, fraction, outwardSign * distance),
+                ),
+              ),
+            ),
+          )
+          .filter(Number.isFinite);
+        return medianFinite(distanceMedians);
+      };
+      let firstEdge = usableEdges[0];
+      let lastEdge = usableEdges[usableEdges.length - 1];
+      let firstLanding = sampleLanding(firstEdge, -1);
+      let lastLanding = sampleLanding(lastEdge, 1);
+      // Strongest signal: actual terrain immediately outside both ends.
+      let uphillDirection = 0;
+      if (
+        Number.isFinite(firstLanding) &&
+        Number.isFinite(lastLanding) &&
+        Math.abs(lastLanding - firstLanding) > 0.025
+      ) {
+        uphillDirection = lastLanding > firstLanding ? 1 : -1;
+      }
+      // Second signal: the overall terrain trend through all CAD tread edges.
+      // Use this only if the landing elevations are essentially tied.
+      if (!uphillDirection && Math.abs(terrainSlopePerEdge) > 0.006) {
+        uphillDirection = terrainSlopePerEdge > 0 ? 1 : -1;
+      }
+      // Last signal: signed CAD layers. Use this only after terrain evidence,
+      // because some Munisiyah references use +10/-10 on opposite edge conventions.
+      if (!uphillDirection) {
+        const positiveWeight = usableEdges.reduce(
+          (sum, edge) => sum + Number(edge.positiveCount || 0),
+          0,
+        );
+        const negativeWeight = usableEdges.reduce(
+          (sum, edge) => sum + Number(edge.negativeCount || 0),
+          0,
+        );
+        const positiveMeanNormal =
+          positiveWeight > 0
+            ? usableEdges.reduce(
+                (sum, edge) =>
+                  sum + edge.normal * Number(edge.positiveCount || 0),
+                0,
+              ) / positiveWeight
+            : NaN;
+        const negativeMeanNormal =
+          negativeWeight > 0
+            ? usableEdges.reduce(
+                (sum, edge) =>
+                  sum + edge.normal * Number(edge.negativeCount || 0),
+                0,
+              ) / negativeWeight
+            : NaN;
+        if (
+          Number.isFinite(positiveMeanNormal) &&
+          Number.isFinite(negativeMeanNormal) &&
+          Math.abs(positiveMeanNormal - negativeMeanNormal) > 0.12
+        ) {
+          uphillDirection = Math.sign(positiveMeanNormal - negativeMeanNormal);
+        }
+      }
+      // If still ambiguous, keep the original CAD order instead of forcing a
+      // global assumption that can reverse otherwise-correct staircases.
+      if (!uphillDirection) uphillDirection = 1;
+      if (uphillDirection < 0) {
+        usableEdges = usableEdges.slice().reverse();
+        terrainByEdge.reverse();
+        terrainSlopePerEdge = Math.abs(terrainSlopePerEdge);
+        // Re-sample after reversing so "first" is always the lower landing.
+        firstEdge = usableEdges[0];
+        lastEdge = usableEdges[usableEdges.length - 1];
+        firstLanding = sampleLanding(firstEdge, -1);
+        lastLanding = sampleLanding(lastEdge, 1);
+      }
+      // Determine the EXACT tread pairs that can actually render before choosing
+      // staircase endpoint elevations. The CAD run can contain extra/sliver edges
+      // or gaps that are intentionally skipped later. Using usableEdges[0]/last for
+      // height anchoring can therefore anchor the staircase somewhere that has no
+      // visible step and leave a black masked gap below the real first tread.
+      const buildRenderablePairs = (candidateEdges) => {
+        const pairs = [];
+        for (
+          let sourceIndex = 0;
+          sourceIndex < candidateEdges.length - 1;
+          sourceIndex += 1
+        ) {
+          const low = candidateEdges[sourceIndex];
+          const high = candidateEdges[sourceIndex + 1];
+          const alongStart = Math.max(low.alongMin, high.alongMin);
+          const alongEnd = Math.min(low.alongMax, high.alongMax);
+          const overlapLength = alongEnd - alongStart;
+          const lowWidth = Math.max(0, low.alongMax - low.alongMin);
+          const highWidth = Math.max(0, high.alongMax - high.alongMin);
+          const referenceWidth = Math.max(0.001, Math.min(lowWidth, highWidth));
+          const minimumTrueOverlap = Math.max(
+            0.18,
+            Math.min(0.75, referenceWidth * 0.025),
+          );
+          if (overlapLength < minimumTrueOverlap) continue;
+          const normalGap = Math.abs(high.normal - low.normal);
+          const maxPairGap = Math.max(
+            3.5,
+            Math.min(12, 0.28 * Math.max(lowWidth, highWidth)),
+          );
+          if (normalGap > maxPairGap) continue;
+          pairs.push({
+            low,
+            high,
+            alongStart,
+            alongEnd,
+            sourceIndex,
+            normalGap,
+          });
+        }
+        return pairs;
+      };
+      const sampleTerrainEdgeMedian = (alongMin, alongMax, normal) =>
+        medianFinite(
+          [0.05, 0.18, 0.35, 0.5, 0.65, 0.82, 0.95].map((fraction) => {
+            const along = alongMin + (alongMax - alongMin) * fraction;
+            return getTerrainHeight({
+              x: ux * along + nx * normal,
+              z: uz * along + nz * normal,
+            });
+          }),
+        );
+      const sampleTerrainEdgeHighest = (alongMin, alongMax, normal) =>
+        maxFinite(
+          [0.02, 0.08, 0.16, 0.28, 0.4, 0.5, 0.6, 0.72, 0.84, 0.92, 0.98].map(
+            (fraction) => {
+              const along = alongMin + (alongMax - alongMin) * fraction;
+              return getTerrainHeight({
+                x: ux * along + nx * normal,
+                z: uz * along + nz * normal,
+              });
+            },
+          ),
+        );
+      // For the LOW end of a wide staircase section, use the lowest Terrain
+      // (After) elevation that the actual first-step footprint intersects.
+      // Sampling the full tread rectangle (not just its centre line) prevents a
+      // sloping landing from lifting the whole stair section above one low corner.
+      const sampleTerrainFootprintMinimum = (
+        alongMin,
+        alongMax,
+        normalStart,
+        normalEnd,
+      ) => {
+        const values = [];
+        const alongFractions = [0.03, 0.18, 0.35, 0.5, 0.65, 0.82, 0.97];
+        const normalFractions = [0.03, 0.2, 0.4, 0.6, 0.8, 0.97];
+        alongFractions.forEach((alongFraction) => {
+          const along = alongMin + (alongMax - alongMin) * alongFraction;
+          normalFractions.forEach((normalFraction) => {
+            const normal =
+              normalStart + (normalEnd - normalStart) * normalFraction;
+            const elevation = Number(
+              getTerrainHeight({
+                x: ux * along + nx * normal,
+                z: uz * along + nz * normal,
+              }),
+            );
+            if (Number.isFinite(elevation)) values.push(elevation);
+          });
+        });
+        return values.length ? Math.min(...values) : NaN;
+      };
+      const getEndpointAnchors = (pairs) => {
+        if (!pairs.length) return null;
+        const firstPair = pairs[0];
+        const lastPair = pairs[pairs.length - 1];
+        const finalEdge = lastPair.high;
+        const previousEdge = lastPair.low;
+        const finalGap = Math.abs(finalEdge.normal - previousEdge.normal);
+        const topTreadDepth =
+          Number.isFinite(finalGap) && finalGap > 0.02
+            ? finalGap
+            : Math.max(0.18, medianGap);
+        const topDirection = Math.sign(
+          finalEdge.normal - previousEdge.normal || 1,
+        );
+        const topNormalStart = finalEdge.normal;
+        const topNormalEnd = finalEdge.normal + topDirection * topTreadDepth;
+        // Fallback endpoint rule requested for 2-D CAD stairs:
+        //   lower end = Terrain (After) exactly where the first rendered step begins
+        //   upper end = Terrain (After) exactly where the final rendered step ends
+        // Use a median across the actual stair width so one noisy TIN triangle does
+        // not lift the entire staircase away from the landing.
+        const startTerrain = sampleTerrainEdgeMedian(
+          firstPair.alongStart,
+          firstPair.alongEnd,
+          firstPair.low.normal,
+        );
+        const endTerrain = sampleTerrainEdgeMedian(
+          lastPair.alongStart,
+          lastPair.alongEnd,
+          topNormalEnd,
+        );
+        return {
+          firstPair,
+          lastPair,
+          topTreadDepth,
+          topNormalStart,
+          topNormalEnd,
+          startTerrain,
+          endTerrain,
+        };
+      };
+      let renderablePairs = buildRenderablePairs(usableEdges);
+      if (!renderablePairs.length) return;
+      let endpointAnchors = getEndpointAnchors(renderablePairs);
+      // The outside-landing heuristic above normally orients the run correctly.
+      // The actual rendered-step endpoints are the final authority, however. If
+      // their Terrain (After) samples say the current end is lower than the start,
+      // reverse the run so the first rendered step is always the lower end.
+      if (
+        endpointAnchors &&
+        Number.isFinite(endpointAnchors.startTerrain) &&
+        Number.isFinite(endpointAnchors.endTerrain) &&
+        endpointAnchors.endTerrain < endpointAnchors.startTerrain - 0.025
+      ) {
+        usableEdges = usableEdges.slice().reverse();
+        terrainByEdge.reverse();
+        firstEdge = usableEdges[0];
+        lastEdge = usableEdges[usableEdges.length - 1];
+        firstLanding = sampleLanding(firstEdge, -1);
+        lastLanding = sampleLanding(lastEdge, 1);
+        renderablePairs = buildRenderablePairs(usableEdges);
+        if (!renderablePairs.length) return;
+        endpointAnchors = getEndpointAnchors(renderablePairs);
+      }
+      const nominalStep =
+        usableEdges.reduce((sum, edge) => {
+          const average =
+            edge.stepHeights.reduce((s, value) => s + value, 0) /
+            Math.max(1, edge.stepHeights.length);
+          return sum + average;
+        }, 0) / usableEdges.length;
+      const nominalRiser = clamp(nominalStep || defaultStepHeight, 0.08, 0.18);
+      // A very wide landscape staircase is often NOT one rectangular staircase.
+      // Different portions of the same CAD edge can start/stop at different
+      // normals, which means each width-section has a different number of steps
+      // and can connect to Terrain (After) at a different elevation.
+      //
+      // Sweep across the stair width using every real overlap boundary. Each band
+      // receives only the tread pairs that actually exist across that band. Bands
+      // with the same sequence of treads are merged back together. This preserves
+      // the CAD footprint while avoiding one giant shared start/end elevation.
+      const buildWidthSections = (pairs) => {
+        const rawBreakpoints = [];
+        pairs.forEach((pair) => {
+          if (Number.isFinite(pair.alongStart))
+            rawBreakpoints.push(pair.alongStart);
+          if (Number.isFinite(pair.alongEnd))
+            rawBreakpoints.push(pair.alongEnd);
+        });
+        rawBreakpoints.sort((a, b) => a - b);
+        if (rawBreakpoints.length < 2) return [];
+        // CAD endpoints that differ only by a few centimetres are the same visual
+        // boundary. Snap them together so tiny sliver sections are not invented.
+        const breakpoints = [];
+        const SNAP = 0.16;
+        rawBreakpoints.forEach((value) => {
+          const lastIndex = breakpoints.length - 1;
+          if (lastIndex < 0 || value - breakpoints[lastIndex] > SNAP) {
+            breakpoints.push(value);
+          } else {
+            breakpoints[lastIndex] = (breakpoints[lastIndex] + value) / 2;
+          }
+        });
+        const bands = [];
+        for (let index = 0; index < breakpoints.length - 1; index += 1) {
+          const alongMin = breakpoints[index];
+          const alongMax = breakpoints[index + 1];
+          if (alongMax - alongMin < 0.18) continue;
+          const center = (alongMin + alongMax) / 2;
+          const activePairs = pairs
+            .filter(
+              (pair) =>
+                pair.alongStart <= center + 0.025 &&
+                pair.alongEnd >= center - 0.025,
+            )
+            .slice()
+            .sort((a, b) => a.sourceIndex - b.sourceIndex);
+          if (!activePairs.length) continue;
+          // A skipped/non-overlapping CAD pair is a real break in the staircase.
+          // Split such bands into separate stair sections rather than letting one
+          // elevation slope or one handrail jump across the missing steps.
+          const sequences = [];
+          let sequence = [activePairs[0]];
+          for (
+            let pairIndex = 1;
+            pairIndex < activePairs.length;
+            pairIndex += 1
+          ) {
+            const previous = activePairs[pairIndex - 1];
+            const current = activePairs[pairIndex];
+            if (current.sourceIndex !== previous.sourceIndex + 1) {
+              if (sequence.length) sequences.push(sequence);
+              sequence = [];
+            }
+            sequence.push(current);
+          }
+          if (sequence.length) sequences.push(sequence);
+          sequences.forEach((sequencePairs) => {
+            if (!sequencePairs.length) return;
+            const signature = sequencePairs
+              .map((pair) => String(pair.sourceIndex))
+              .join(",");
+            bands.push({
+              alongMin,
+              alongMax,
+              signature,
+              pairs: sequencePairs,
+            });
+          });
+        }
+        // Merge adjacent width-bands only when they contain the exact same stair
+        // sequence. If one side stops sooner, it remains its own section and gets
+        // its own Terrain endpoint elevations and handrail length.
+        bands.sort(
+          (a, b) =>
+            a.alongMin - b.alongMin ||
+            a.alongMax - b.alongMax ||
+            a.signature.localeCompare(b.signature),
+        );
+        const merged = [];
+        bands.forEach((band) => {
+          const current = merged[merged.length - 1];
+          if (
+            current &&
+            current.signature === band.signature &&
+            Math.abs(band.alongMin - current.alongMax) <= 0.18
+          ) {
+            current.alongMax = Math.max(current.alongMax, band.alongMax);
+            return;
+          }
+          merged.push({ ...band });
+        });
+        return merged.filter(
+          (section) =>
+            section.alongMax - section.alongMin >= 0.18 &&
+            Array.isArray(section.pairs) &&
+            section.pairs.length,
+        );
+      };
+      let widthSections = buildWidthSections(renderablePairs);
+      // Extremely simple stair runs may have coincident/near-coincident CAD
+      // endpoints and produce no sweep bands. Preserve them with one conservative
+      // section rather than dropping visible stairs.
+      if (!widthSections.length && renderablePairs.length) {
+        const widestPair = renderablePairs.reduce((best, pair) => {
+          const width = pair.alongEnd - pair.alongStart;
+          return !best || width > best.width ? { pair, width } : best;
+        }, null);
+        if (widestPair && widestPair.pair && widestPair.width >= 0.18) {
+          widthSections = [
+            {
+              alongMin: widestPair.pair.alongStart,
+              alongMax: widestPair.pair.alongEnd,
+              signature: renderablePairs
+                .map((pair) => String(pair.sourceIndex))
+                .join(","),
+              pairs: renderablePairs,
+            },
+          ];
+        }
+      }
+      const isSplitWideStaircase = widthSections.length > 1;
+      // The staircase may be split into several side-by-side width sections
+      // because different parts stop at different lengths. Only the two OUTER
+      // edges of the complete staircase are allowed to have vertical side caps.
+      // Creating caps at every internal section boundary is what produced the
+      // huge white divider wall visible in Muanisiyah.
+      const staircaseOuterAlongMin = Math.min(
+        ...widthSections.map((section) => Number(section.alongMin)),
+      );
+      const staircaseOuterAlongMax = Math.max(
+        ...widthSections.map((section) => Number(section.alongMax)),
+      );
+      const outerEdgeTolerance = 0.12;
+      const maximumSectionPairCount = Math.max(
+        1,
+        ...widthSections.map((section) =>
+          Array.isArray(section && section.pairs) ? section.pairs.length : 0,
+        ),
+      );
+      const endpointSurfaceLift = Number.isFinite(Number(surfaceClearance))
+        ? Number(surfaceClearance)
+        : 0;
+      const shouldSynchronizeSplitElevations = Boolean(
+        synchronizeSplitSectionElevations && isSplitWideStaircase,
+      );
+      let sharedSplitElevationLadder = null;
+      if (shouldSynchronizeSplitElevations && renderablePairs.length) {
+        const sharedFirstSourceIndex = Math.min(
+          ...renderablePairs.map((pair) => Number(pair.sourceIndex)),
+        );
+        const sharedLastSourceIndex = Math.max(
+          ...renderablePairs.map((pair) => Number(pair.sourceIndex)),
+        );
+        const sharedRiserCount = Math.max(
+          1,
+          sharedLastSourceIndex - sharedFirstSourceIndex + 1,
+        );
+        const sharedTreadDepths = renderablePairs
+          .map((pair) =>
+            Math.abs(Number(pair.high.normal) - Number(pair.low.normal)),
+          )
+          .filter((value) => Number.isFinite(value) && value > 0.02)
+          .sort((a, b) => a - b);
+        const sharedMedianTreadDepth = sharedTreadDepths.length
+          ? sharedTreadDepths[Math.floor(sharedTreadDepths.length / 2)]
+          : NaN;
+        const sharedStartTerrain = Number.isFinite(
+          Number(endpointAnchors && endpointAnchors.startTerrain),
+        )
+          ? Number(endpointAnchors.startTerrain)
+          : Number.isFinite(Number(firstLanding))
+            ? Number(firstLanding)
+            : 0;
+        const sharedEndTerrain = Number.isFinite(
+          Number(endpointAnchors && endpointAnchors.endTerrain),
+        )
+          ? Number(endpointAnchors.endTerrain)
+          : Number.isFinite(Number(lastLanding))
+            ? Number(lastLanding)
+            : NaN;
+        const sharedStartY = sharedStartTerrain + endpointSurfaceLift;
+        const sharedEndY = Number.isFinite(sharedEndTerrain)
+          ? sharedEndTerrain + endpointSurfaceLift
+          : NaN;
+        const sharedRise = Number.isFinite(sharedEndY)
+          ? sharedEndY - sharedStartY
+          : NaN;
+        const sharedRawStepHeight = Number.isFinite(sharedRise)
+          ? sharedRise / sharedRiserCount
+          : NaN;
+        let sharedResolvedCadStepHeight = NaN;
+        if (typeof resolveStepHeight === "function") {
+          try {
+            sharedResolvedCadStepHeight = Number(
+              resolveStepHeight({
+                stepCount: sharedRiserCount,
+                treadDepth: sharedMedianTreadDepth,
+                nominalRiser,
+                terrainStart: sharedStartY,
+                terrainEnd: sharedEndY,
+                sectionRise: sharedRise,
+                sectionIndex: -1,
+                splitWideStaircase: true,
+                sharedSplitElevationLadder: true,
+              }),
+            );
+          } catch (error) {
+            console.warn("Shared stair CAD step-height resolver failed:", error);
+          }
+        }
+        const hasSharedResolvedCadStepHeight =
+          Number.isFinite(sharedResolvedCadStepHeight) &&
+          sharedResolvedCadStepHeight >= 0.05 &&
+          sharedResolvedCadStepHeight <= 0.45;
+        const sharedStepHeight = hasSharedResolvedCadStepHeight
+          ? sharedResolvedCadStepHeight
+          : Number.isFinite(sharedRawStepHeight) &&
+              sharedRawStepHeight >= 0.055 &&
+              sharedRawStepHeight <= 0.22
+            ? sharedRawStepHeight
+            : clamp(nominalRiser || defaultStepHeight, 0.08, 0.18);
+        let sharedBaseY = sharedStartY;
+        if (Number.isFinite(sharedEndY)) {
+          if (hasSharedResolvedCadStepHeight) {
+            // Preserve the CAD riser height while keeping the upper end from
+            // falling below the finished Terrain/Pedestrian landing.
+            const requiredTopY = Math.max(
+              sharedEndY,
+              sharedStartY + sharedStepHeight * sharedRiserCount,
+            );
+            sharedBaseY =
+              requiredTopY - sharedStepHeight * sharedRiserCount;
+          }
+        }
+        sharedSplitElevationLadder = {
+          baseY: sharedBaseY,
+          stepHeight: sharedStepHeight,
+          firstSourceIndex: sharedFirstSourceIndex,
+          lastSourceIndex: sharedLastSourceIndex,
+          riserCount: sharedRiserCount,
+        };
+      }
+      const sharedSplitBottomLandingY = sharedSplitElevationLadder
+        ? sharedSplitElevationLadder.baseY
+        : NaN;
+      const sharedSplitTopLandingY = sharedSplitElevationLadder
+        ? sharedSplitElevationLadder.baseY +
+          sharedSplitElevationLadder.stepHeight *
+            sharedSplitElevationLadder.riserCount
+        : NaN;
+      const sharedSplitTopNormalEnd =
+        sharedSplitElevationLadder &&
+        endpointAnchors &&
+        Number.isFinite(Number(endpointAnchors.topNormalEnd))
+          ? Number(endpointAnchors.topNormalEnd)
+          : NaN;
+      widthSections.forEach((section, sectionIndex) => {
+        const capLeftOuterEdge =
+          Math.abs(Number(section.alongMin) - staircaseOuterAlongMin) <=
+          outerEdgeTolerance;
+        const capRightOuterEdge =
+          Math.abs(Number(section.alongMax) - staircaseOuterAlongMax) <=
+          outerEdgeTolerance;
+        // Clip every tread pair to THIS section of the staircase. This is the key
+        // difference from the old renderer, which expanded every edge bucket to
+        // one shared alongMin/alongMax and flattened the entire wide stairset.
+        let sectionPairs = section.pairs
+          .map((pair) => ({
+            ...pair,
+            alongStart: Math.max(pair.alongStart, section.alongMin),
+            alongEnd: Math.min(pair.alongEnd, section.alongMax),
+          }))
+          .filter((pair) => pair.alongEnd - pair.alongStart >= 0.16);
+        if (!sectionPairs.length) return;
+        const getSectionEndpointAnchors = (pairs) => {
+          if (!pairs.length) return null;
+          const firstPair = pairs[0];
+          const lastPair = pairs[pairs.length - 1];
+          const finalEdge = lastPair.high;
+          const previousEdge = lastPair.low;
+          const finalGap = Math.abs(finalEdge.normal - previousEdge.normal);
+          const topTreadDepth =
+            Number.isFinite(finalGap) && finalGap > 0.02
+              ? finalGap
+              : Math.max(0.18, medianGap);
+          const topDirection = Math.sign(
+            finalEdge.normal - previousEdge.normal || 1,
+          );
+          const topNormalStart = finalEdge.normal;
+          const topNormalEnd = finalEdge.normal + topDirection * topTreadDepth;
+          // IMPORTANT: sample only this section's width. A 40 m-wide staircase
+          // may cross a sloping landing, so using one median across the whole width
+          // can make one side float while the other side cuts into Terrain (After).
+          const sectionAlongStart = Math.max(
+            firstPair.alongStart,
+            section.alongMin,
+          );
+          const sectionAlongEnd = Math.min(
+            firstPair.alongEnd,
+            section.alongMax,
+          );
+          const startTerrain = sampleTerrainFootprintMinimum(
+            sectionAlongStart,
+            sectionAlongEnd,
+            firstPair.low.normal,
+            firstPair.high.normal,
+          );
+          const endAlongStart = Math.max(lastPair.alongStart, section.alongMin);
+          const endAlongEnd = Math.min(lastPair.alongEnd, section.alongMax);
+          const endNormals = [
+            finalEdge.normal,
+            topNormalEnd,
+            topNormalEnd + topDirection * topTreadDepth * 0.75,
+            topNormalEnd + topDirection * topTreadDepth * 1.5,
+            topNormalEnd + topDirection * topTreadDepth * 2.5,
+            topNormalEnd + topDirection * topTreadDepth * 4.0,
+            topNormalEnd + topDirection * topTreadDepth * 6.0,
+          ];
+          const endTerrainCandidates = endNormals
+            .map((normal) =>
+              preferHighestTopLanding
+                ? sampleTerrainEdgeHighest(
+                    endAlongStart,
+                    endAlongEnd,
+                    normal,
+                  )
+                : sampleTerrainEdgeMedian(
+                    endAlongStart,
+                    endAlongEnd,
+                    normal,
+                  ),
+            )
+            .filter(Number.isFinite);
+          const endTerrain = endTerrainCandidates.length
+            ? preferHighestTopLanding
+              ? Math.max(...endTerrainCandidates)
+              : endTerrainCandidates[Math.min(1, endTerrainCandidates.length - 1)]
+            : NaN;
+          return {
+            firstPair,
+            lastPair,
+            topTreadDepth,
+            topNormalStart,
+            topNormalEnd,
+            startTerrain,
+            endTerrain,
+          };
+        };
+        let sectionAnchors = getSectionEndpointAnchors(sectionPairs);
+        // Ordinary sections can orient from their own Terrain anchors. Sections
+        // sharing one synchronized wide staircase must retain the common CAD
+        // direction; reversing only one lateral section makes matching treads use
+        // different indexes and recreates the large height discontinuity.
+        if (
+          !sharedSplitElevationLadder &&
+          sectionAnchors &&
+          Number.isFinite(sectionAnchors.startTerrain) &&
+          Number.isFinite(sectionAnchors.endTerrain) &&
+          sectionAnchors.endTerrain < sectionAnchors.startTerrain - 0.025
+        ) {
+          sectionPairs = sectionPairs
+            .slice()
+            .reverse()
+            .map((pair) => ({
+              ...pair,
+              low: pair.high,
+              high: pair.low,
+            }));
+          sectionAnchors = getSectionEndpointAnchors(sectionPairs);
+        }
+        if (!sectionAnchors) return;
+        const sectionRiserCount = Math.max(1, sectionPairs.length);
+        const broadStartFallback = medianFinite([
+          firstLanding,
+          terrainByEdge[
+            Math.min(
+              terrainByEdge.length - 1,
+              Math.max(0, sectionPairs[0].sourceIndex),
+            )
+          ],
+        ]);
+        const broadEndFallback = medianFinite([
+          lastLanding,
+          terrainByEdge[
+            Math.min(
+              terrainByEdge.length - 1,
+              Math.max(
+                0,
+                sectionPairs[sectionPairs.length - 1].sourceIndex + 1,
+              ),
+            )
+          ],
+        ]);
+        let designedStartY = Number.isFinite(sectionAnchors.startTerrain)
+          ? sectionAnchors.startTerrain
+          : Number.isFinite(broadStartFallback)
+            ? broadStartFallback
+            : 0;
+        let designedEndY = Number.isFinite(sectionAnchors.endTerrain)
+          ? sectionAnchors.endTerrain
+          : Number.isFinite(broadEndFallback)
+            ? broadEndFallback
+            : designedStartY + nominalRiser * sectionRiserCount;
+        // Align stair landings to the visible PATHS surface, not to the raw
+        // Terrain (After) vertex plane. Map.vue passes the Pedestrian Space
+        // clearance here, so the final/top tread meets the walking path instead
+        // of ending several centimetres below it.
+        designedStartY += endpointSurfaceLift;
+        designedEndY += endpointSurfaceLift;
+        // If valid Terrain samples are available they are authoritative. The
+        // orientation pass above should already put the lower endpoint first.
+        // Only protect against unresolved/noisy fallbacks here.
+        if (
+          !Number.isFinite(sectionAnchors.endTerrain) &&
+          designedEndY < designedStartY
+        ) {
+          designedEndY = designedStartY + nominalRiser * sectionRiserCount;
+        }
+        const sectionRise = designedEndY - designedStartY;
+        const rawSectionStepHeight =
+          sectionRiserCount > 0
+            ? sectionRise / sectionRiserCount
+            : nominalRiser;
+        const sectionTreadDepths = sectionPairs
+          .map((pair) => Math.abs(Number(pair.high.normal) - Number(pair.low.normal)))
+          .filter((value) => Number.isFinite(value) && value > 0.02)
+          .sort((a, b) => a - b);
+        const medianTreadDepth = sectionTreadDepths.length
+          ? sectionTreadDepths[Math.floor(sectionTreadDepths.length / 2)]
+          : NaN;
+        let resolvedCadStepHeight = NaN;
+        if (typeof resolveStepHeight === "function") {
+          try {
+            resolvedCadStepHeight = Number(
+              resolveStepHeight({
+                stepCount: sectionRiserCount,
+                treadDepth: medianTreadDepth,
+                nominalRiser,
+                terrainStart: designedStartY,
+                terrainEnd: designedEndY,
+                sectionRise,
+                sectionIndex,
+                splitWideStaircase: isSplitWideStaircase,
+              }),
+            );
+          } catch (error) {
+            console.warn("Stair CAD step-height resolver failed:", error);
+          }
+        }
+        const hasResolvedCadStepHeight =
+          Number.isFinite(resolvedCadStepHeight) &&
+          resolvedCadStepHeight >= 0.05 &&
+          resolvedCadStepHeight <= 0.45;
+        // Project-specific CAD design data is authoritative when supplied.
+        // Otherwise preserve the original Terrain-derived/generic behaviour.
+        let sectionStepHeight = hasResolvedCadStepHeight
+          ? resolvedCadStepHeight
+          : Number.isFinite(rawSectionStepHeight) &&
+              rawSectionStepHeight >= 0.055 &&
+              rawSectionStepHeight <= 0.22
+            ? rawSectionStepHeight
+            : clamp(nominalRiser || defaultStepHeight, 0.08, 0.18);
+        if (sharedSplitElevationLadder) {
+          sectionStepHeight = sharedSplitElevationLadder.stepHeight;
+          const sectionFirstSourceIndex = Number(
+            sectionPairs[0].sourceIndex,
+          );
+          const sectionLastSourceIndex = Number(
+            sectionPairs[sectionPairs.length - 1].sourceIndex,
+          );
+          const sourceIndexOffset = Math.max(
+            0,
+            sectionFirstSourceIndex -
+              sharedSplitElevationLadder.firstSourceIndex,
+          );
+          const sectionLastRiserOffset = Math.max(
+            sourceIndexOffset + 1,
+            sectionLastSourceIndex -
+              sharedSplitElevationLadder.firstSourceIndex +
+              1,
+          );
+          designedStartY =
+            sharedSplitElevationLadder.baseY +
+            sectionStepHeight * sourceIndexOffset;
+          designedEndY =
+            sharedSplitElevationLadder.baseY +
+            sectionStepHeight * sectionLastRiserOffset;
+        } else if (hasResolvedCadStepHeight) {
+          const cadTotalRise =
+            sectionStepHeight * sectionRiserCount;
+          const cadTopFromLowerLanding =
+            designedStartY + cadTotalRise;
+          const sampledUpperLanding = Number(designedEndY);
+          // Use whichever requirement is higher:
+          // 1) the upper Terrain/Pedestrian landing sampled from the rebuilt TIN;
+          // 2) the lower landing plus the cumulative CAD riser rise.
+          //
+          // This is the important v8 change. v7 always solved backwards from a
+          // sometimes-low upper median, which could pull the bottom below the
+          // floating island. The Muanisiyah M:24 run, for example, must not lose
+          // its cumulative rise just because the upper edge sits on a cross-slope.
+          const targetUpperLanding =
+            Number.isFinite(sampledUpperLanding)
+              ? Math.max(sampledUpperLanding, cadTopFromLowerLanding)
+              : cadTopFromLowerLanding;
+          designedEndY = targetUpperLanding;
+          designedStartY = targetUpperLanding - cadTotalRise;
+        } else {
+          // Generic/no-CAD fallback: connect the reconstructed run normally.
+          designedEndY =
+            designedStartY + sectionStepHeight * sectionRiserCount;
+        }
+        sectionPairs.forEach((pair, renderIndex) => {
+          const { low, high, alongStart, alongEnd } = pair;
+          low.segmentIds.forEach((id) => renderedSegmentIds.add(id));
+          high.segmentIds.forEach((id) => renderedSegmentIds.add(id));
+          // In a split wide staircase, sourceIndex is the common longitudinal
+          // tread number shared by every lateral section. Use it directly so a
+          // section that begins later (or follows a real CAD gap) still lands on
+          // exactly the same elevation as its neighbouring section.
+          const currentY = sharedSplitElevationLadder
+            ? sharedSplitElevationLadder.baseY +
+              sectionStepHeight *
+                Math.max(
+                  0,
+                  Number(pair.sourceIndex) -
+                    sharedSplitElevationLadder.firstSourceIndex,
+                )
+            : designedStartY + sectionStepHeight * renderIndex;
+          const nextY = currentY + sectionStepHeight;
+          const makePoint = (along, normal, y) => ({
+            x: ux * along + nx * normal,
+            y,
+            z: uz * along + nz * normal,
+          });
+          const visibleAlongIntervals = getVisibleAlongIntervals(
+            alongStart,
+            alongEnd,
+            low.normal,
+            high.normal,
+            ux,
+            uz,
+            nx,
+            nz,
+          );
+          visibleAlongIntervals.forEach((visibleInterval) => {
+            const visibleAlongStart = Number(visibleInterval.alongStart);
+            const visibleAlongEnd = Number(visibleInterval.alongEnd);
+            if (
+              ![visibleAlongStart, visibleAlongEnd].every(Number.isFinite) ||
+              visibleAlongEnd - visibleAlongStart < 0.055
+            ) {
+              return;
+            }
+            const p1 = makePoint(visibleAlongStart, low.normal, currentY);
+            const p2 = makePoint(visibleAlongEnd, low.normal, currentY);
+            const p3 = makePoint(visibleAlongEnd, high.normal, currentY);
+            const p4 = makePoint(visibleAlongStart, high.normal, currentY);
+            pushTri(p1, p2, p3);
+            pushTri(p1, p3, p4);
+            const r1 = makePoint(visibleAlongStart, high.normal, currentY);
+            const r2 = makePoint(visibleAlongEnd, high.normal, currentY);
+            const r3 = makePoint(visibleAlongEnd, high.normal, nextY);
+            const r4 = makePoint(visibleAlongStart, high.normal, nextY);
+            pushTri(r1, r2, r3);
+            pushTri(r1, r3, r4);
+            // Only cap the genuine outside edge of the staircase. A new edge
+            // created by carving out Water must remain open, otherwise it would
+            // become another synthetic white wall across the cascade channel.
+            const isOriginalLeftEdge =
+              Math.abs(visibleAlongStart - alongStart) <= 0.03;
+            const isOriginalRightEdge =
+              Math.abs(visibleAlongEnd - alongEnd) <= 0.03;
+            if (capLeftOuterEdge && isOriginalLeftEdge) {
+              const leftTop = makePoint(
+                visibleAlongStart,
+                high.normal,
+                nextY,
+              );
+              const leftBottom = makePoint(
+                visibleAlongStart,
+                high.normal,
+                currentY,
+              );
+              pushTri(p1, p4, leftTop);
+              pushTri(p1, leftTop, leftBottom);
+            }
+            if (capRightOuterEdge && isOriginalRightEdge) {
+              const rightTop = makePoint(
+                visibleAlongEnd,
+                high.normal,
+                nextY,
+              );
+              const rightBottom = makePoint(
+                visibleAlongEnd,
+                high.normal,
+                currentY,
+              );
+              pushTri(p2, rightTop, p3);
+              pushTri(p2, rightBottom, rightTop);
+            }
+            pushLine(p1, p2);
+            treadCount += 1;
+            maskCells.push({
+              stairRunId: stairRunIndex,
+              sectionId: sectionIndex,
+              splitWideStaircase: isSplitWideStaircase,
+              sharedSplitOuterAlongMin: isSplitWideStaircase
+                ? staircaseOuterAlongMin
+                : NaN,
+              sharedSplitOuterAlongMax: isSplitWideStaircase
+                ? staircaseOuterAlongMax
+                : NaN,
+              sharedSplitBottomLandingY,
+              sharedSplitTopLandingY,
+              sharedSplitTopNormalEnd,
+              treadIndex: renderIndex,
+              treadY: currentY,
+              alongMin: visibleAlongStart,
+              alongMax: visibleAlongEnd,
+              normalStart: low.normal,
+              normalEnd: high.normal,
+              normalMin: Math.min(low.normal, high.normal),
+              normalMax: Math.max(low.normal, high.normal),
+              sectionStepHeight,
+              sectionRiserCount,
+              bottomLandingY: designedStartY,
+              topLandingY: designedEndY,
+            });
+          });
+        });
+        // Add the final/top tread for THIS width-section. Because sections can
+        // contain different numbers of stair pairs, each one naturally ends at a
+        // different normal coordinate and therefore gets the correct rail length.
+        const finalPair = sectionPairs[sectionPairs.length - 1];
+        const topAlongStart = Math.max(finalPair.alongStart, section.alongMin);
+        const topAlongEnd = Math.min(finalPair.alongEnd, section.alongMax);
+        const topY = designedEndY;
+        const topNormalStart = sectionAnchors.topNormalStart;
+        const topNormalEnd = sectionAnchors.topNormalEnd;
+        const isShorterSplitSection =
+          suppressSplitSectionTopExtensions &&
+          isSplitWideStaircase &&
+          sectionPairs.length < maximumSectionPairCount;
+        if (
+          !suppressSyntheticTopTreads &&
+          !isShorterSplitSection &&
+          topAlongEnd - topAlongStart >= 0.16
+        ) {
+          const makeTopPoint = (along, normal) => ({
+            x: ux * along + nx * normal,
+            y: topY,
+            z: uz * along + nz * normal,
+          });
+          const t1 = makeTopPoint(topAlongStart, topNormalStart);
+          const t2 = makeTopPoint(topAlongEnd, topNormalStart);
+          const t3 = makeTopPoint(topAlongEnd, topNormalEnd);
+          const t4 = makeTopPoint(topAlongStart, topNormalEnd);
+          pushTri(t1, t2, t3);
+          pushTri(t1, t3, t4);
+          // The last/top tread also contributes only its outer nosing edge.
+          pushLine(t1, t2);
+          treadCount += 1;
+          maskCells.push({
+            stairRunId: stairRunIndex,
+            sectionId: sectionIndex,
+            splitWideStaircase: isSplitWideStaircase,
+            sharedSplitOuterAlongMin: isSplitWideStaircase
+              ? staircaseOuterAlongMin
+              : NaN,
+            sharedSplitOuterAlongMax: isSplitWideStaircase
+              ? staircaseOuterAlongMax
+              : NaN,
+            sharedSplitBottomLandingY,
+            sharedSplitTopLandingY,
+            sharedSplitTopNormalEnd,
+            treadIndex: sectionPairs.length,
+            treadY: topY,
+            alongMin: Math.min(topAlongStart, topAlongEnd),
+            alongMax: Math.max(topAlongStart, topAlongEnd),
+            normalStart: topNormalStart,
+            normalEnd: topNormalEnd,
+            normalMin: Math.min(topNormalStart, topNormalEnd),
+            normalMax: Math.max(topNormalStart, topNormalEnd),
+            sectionStepHeight,
+            sectionRiserCount,
+            bottomLandingY: designedStartY,
+            topLandingY: designedEndY,
+          });
+        }
+      });
+      // Handrails are generated only AFTER the exact Terrain (After) cut-out
+      // profile has been constructed below. This guarantees that a stair-like
+      // CAD group cannot receive a rail merely because it emitted ten blue
+      // treads; it must also be one of the cut-outs actually active in Map.vue.
+      // Merge only genuinely touching rendered tread cells. A skipped tread pair
+      // starts a new mask profile instead of bridging a large empty region. The
+      // resulting oriented rectangles are therefore a tight 2-D footprint of the
+      // actual staircase mesh, not a coarse CAD/audit bounding box.
+      if (maskCells.length) {
+        const cells = maskCells
+          .filter((cell) =>
+            [
+              cell.alongMin,
+              cell.alongMax,
+              cell.normalMin,
+              cell.normalMax,
+            ].every(Number.isFinite),
+          )
+          .sort(
+            (a, b) =>
+              Number(a.sectionId || 0) - Number(b.sectionId || 0) ||
+              Number(a.treadIndex || 0) - Number(b.treadIndex || 0) ||
+              a.normalMin - b.normalMin,
+          );
+        const mergedCells = [];
+        cells.forEach((cell) => {
+          const current = mergedCells[mergedCells.length - 1];
+          if (!current) {
+            mergedCells.push({ ...cell, treadCells: [cell] });
+            return;
+          }
+          const normalGap = cell.normalMin - current.normalMax;
+          const alongOverlap =
+            Math.min(current.alongMax, cell.alongMax) -
+            Math.max(current.alongMin, cell.alongMin);
+          const currentWidth = Math.max(
+            0.001,
+            current.alongMax - current.alongMin,
+          );
+          const cellWidth = Math.max(0.001, cell.alongMax - cell.alongMin);
+          const minimumOverlap = Math.min(
+            0.12,
+            Math.min(currentWidth, cellWidth) * 0.02,
+          );
+          if (
+            current.sectionId === cell.sectionId &&
+            normalGap <= 0.08 &&
+            alongOverlap >= minimumOverlap
+          ) {
+            current.alongMin = Math.min(current.alongMin, cell.alongMin);
+            current.alongMax = Math.max(current.alongMax, cell.alongMax);
+            current.normalMin = Math.min(current.normalMin, cell.normalMin);
+            current.normalMax = Math.max(current.normalMax, cell.normalMax);
+            if (!Array.isArray(current.treadCells)) current.treadCells = [];
+            current.treadCells.push(cell);
+          } else {
+            mergedCells.push({ ...cell, treadCells: [cell] });
+          }
+        });
+        mergedCells.forEach((cell) => {
+          if (
+            cell.alongMax - cell.alongMin < 0.12 ||
+            cell.normalMax - cell.normalMin < 0.05
+          ) {
+            return;
+          }
+          const treadCells = (
+            Array.isArray(cell.treadCells) ? cell.treadCells : []
+          )
+            .filter((tread) =>
+              [
+                tread.treadIndex,
+                tread.treadY,
+                tread.alongMin,
+                tread.alongMax,
+                tread.normalStart,
+                tread.normalEnd,
+              ].every(Number.isFinite),
+            )
+            .sort((a, b) => a.treadIndex - b.treadIndex);
+          // "Steps" is the authoritative count for THIS exact contiguous cut-out
+          // group. It counts real rendered horizontal treads, not source CAD lines
+          // and not the size of the broader spatial cluster.
+          const uniqueStepIndexes = new Set(
+            treadCells.map((tread) => Number(tread.treadIndex)),
+          );
+          const Steps = uniqueStepIndexes.size;
+          // Handrail eligibility uses the exact rendered tread elevations for this
+          // contiguous staircase section. A group must contain at least 3 real
+          // rendered steps AND show a clear vertical change; this rejects flat
+          // decorative/duplicate CAD linework while allowing short real stairs.
+          const finiteTreadElevations = treadCells
+            .map((tread) => Number(tread.treadY))
+            .filter(Number.isFinite);
+          const treadElevationSpan = finiteTreadElevations.length
+            ? Math.max(...finiteTreadElevations) -
+              Math.min(...finiteTreadElevations)
+            : 0;
+          const hasClearElevationChange = treadElevationSpan >= 0.12;
+          const handrailEligible =
+            Steps >= 3 && treadCells.length >= 3 && hasClearElevationChange;
+          const firstRenderedTread = treadCells[0] || {};
+          const lastRenderedTread = treadCells[treadCells.length - 1] || {};
+          const profileStepHeight = Number(firstRenderedTread.sectionStepHeight);
+          const profileBottomLandingY = Number(firstRenderedTread.bottomLandingY);
+          const profileTopLandingY = Number(lastRenderedTread.topLandingY);
+          const profile = {
+            stairRunId: Number(cell.stairRunId),
+            sectionId: Number(cell.sectionId || 0),
+            splitWideStaircase: Boolean(cell.splitWideStaircase),
+            sharedSplitOuterAlongMin: Number(cell.sharedSplitOuterAlongMin),
+            sharedSplitOuterAlongMax: Number(cell.sharedSplitOuterAlongMax),
+            sharedSplitBottomLandingY: Number(cell.sharedSplitBottomLandingY),
+            sharedSplitTopLandingY: Number(cell.sharedSplitTopLandingY),
+            sharedSplitTopNormalEnd: Number(cell.sharedSplitTopNormalEnd),
+            ux,
+            uz,
+            nx,
+            nz,
+            alongMin: cell.alongMin,
+            alongMax: cell.alongMax,
+            normalMin: cell.normalMin,
+            normalMax: cell.normalMax,
+            sectionStepHeight: Number.isFinite(profileStepHeight)
+              ? profileStepHeight
+              : NaN,
+            bottomLandingY: Number.isFinite(profileBottomLandingY)
+              ? profileBottomLandingY
+              : Number(firstRenderedTread.treadY),
+            topLandingY: Number.isFinite(profileTopLandingY)
+              ? profileTopLandingY
+              : Number(lastRenderedTread.treadY) +
+                (Number.isFinite(profileStepHeight) ? profileStepHeight : 0),
+            cutoutAlongMin: cell.alongMin,
+            cutoutAlongMax: cell.alongMax,
+            cutoutNormalMin: cell.normalMin,
+            cutoutNormalMax: cell.normalMax,
+            cutoutOnly: true,
+            Steps,
+            stepCount: Steps,
+            handrailEligible,
+            handrailElevationSpan: treadElevationSpan,
+            handrailClearElevationChange: hasClearElevationChange,
+            // Preserve the exact rendered tread rectangles. Map.vue rasterizes
+            // these individual cells instead of masking one coarse rectangle
+            // around the entire variable-width stair section.
+            treadCells: treadCells.map((tread) => ({
+              treadIndex: Number(tread.treadIndex),
+              treadY: Number(tread.treadY),
+              alongMin: Number(tread.alongMin),
+              alongMax: Number(tread.alongMax),
+              normalMin: Number(tread.normalMin),
+              normalMax: Number(tread.normalMax),
+              normalStart: Number(tread.normalStart),
+              normalEnd: Number(tread.normalEnd),
+              sectionStepHeight: Number(tread.sectionStepHeight),
+              sectionRiserCount: Number(tread.sectionRiserCount),
+              stairRunId: Number(tread.stairRunId),
+              sharedSplitOuterAlongMin: Number(tread.sharedSplitOuterAlongMin),
+              sharedSplitOuterAlongMax: Number(tread.sharedSplitOuterAlongMax),
+              sharedSplitBottomLandingY: Number(tread.sharedSplitBottomLandingY),
+              sharedSplitTopLandingY: Number(tread.sharedSplitTopLandingY),
+              sharedSplitTopNormalEnd: Number(tread.sharedSplitTopNormalEnd),
+              bottomLandingY: Number(tread.bottomLandingY),
+              topLandingY: Number(tread.topLandingY),
+            })),
+          };
+          renderedMaskProfiles.push(profile);
+          // User rule: stair handrails are allowed ONLY when ALL conditions are
+          // true: (1) this exact profile is one of Map.vue's active Terrain (After)
+          // cut-outs, (2) this contiguous group contains at least 3 rendered steps,
+          // and (3) those steps show a clear elevation change of at least 0.12 m.
+          if (
+            maskOnly ||
+            !handrailEligible ||
+            !matchesActiveTerrainCutout(profile)
+          ) {
+            return;
+          }
+          const firstCell = treadCells[0];
+          const lastCell = treadCells[treadCells.length - 1];
+          const railNormalStart = firstCell.normalStart;
+          const railNormalEnd = lastCell.normalEnd;
+          if (![railNormalStart, railNormalEnd].every(Number.isFinite)) return;
+          const medianFinite = (values) => {
+            const finite = values
+              .map(Number)
+              .filter(Number.isFinite)
+              .sort((a, b) => a - b);
+            if (!finite.length) return NaN;
+            const middle = Math.floor(finite.length / 2);
+            return finite.length % 2
+              ? finite[middle]
+              : (finite[middle - 1] + finite[middle]) / 2;
+          };
+          let railAlongMin = medianFinite(
+            treadCells.map((tread) => tread.alongMin),
+          );
+          let railAlongMax = medianFinite(
+            treadCells.map((tread) => tread.alongMax),
+          );
+          if (
+            !Number.isFinite(railAlongMin) ||
+            !Number.isFinite(railAlongMax) ||
+            railAlongMax - railAlongMin < 0.8
+          ) {
+            const widest = treadCells.reduce((best, tread) => {
+              const width = Number(tread.alongMax) - Number(tread.alongMin);
+              return !best || width > best.width ? { tread, width } : best;
+            }, null);
+            if (widest && widest.tread) {
+              railAlongMin = widest.tread.alongMin;
+              railAlongMax = widest.tread.alongMax;
+            }
+          }
+          const stairWidth = Math.max(0, railAlongMax - railAlongMin);
+          const runDepth = Math.abs(railNormalEnd - railNormalStart);
+          if (stairWidth < 0.8 || runDepth < 0.35) return;
+          const railHeight = 0.9;
+          const postCount = clamp(Math.ceil(Steps / 6) + 1, 2, 12);
+          const makeRailPoint = (along, normal, y) => ({
+            x: ux * along + nx * normal,
+            y,
+            z: uz * along + nz * normal,
+          });
+          const edgeInset = Math.min(0.12, Math.max(0.035, stairWidth * 0.025));
+          // User rule:
+          // - ordinary staircase: one handrail on each side;
+          // - a very wide staircase that was split into multiple independent
+          //   sub-staircases: ONE handrail down the middle of each sub-section.
+          const railAlongPositions = profile.splitWideStaircase
+            ? [(railAlongMin + railAlongMax) / 2]
+            : [railAlongMin + edgeInset, railAlongMax - edgeInset];
+          railAlongPositions.forEach((along) => {
+            const topStart = makeRailPoint(
+              along,
+              railNormalStart,
+              firstCell.treadY + railHeight,
+            );
+            const topEnd = makeRailPoint(
+              along,
+              railNormalEnd,
+              lastCell.treadY + railHeight,
+            );
+            pushHandrailSegment(topStart, topEnd, 0.032);
+            for (let postIndex = 0; postIndex < postCount; postIndex += 1) {
+              const t = postCount <= 1 ? 0 : postIndex / (postCount - 1);
+              const treadIndex = Math.min(
+                treadCells.length - 1,
+                Math.max(0, Math.round(t * (treadCells.length - 1))),
+              );
+              const tread = treadCells[treadIndex];
+              const normal =
+                railNormalStart + (railNormalEnd - railNormalStart) * t;
+              const topY =
+                firstCell.treadY +
+                railHeight +
+                (lastCell.treadY - firstCell.treadY) * t;
+              const footY = tread.treadY + 0.02;
+              pushHandrailSegment(
+                makeRailPoint(along, normal, footY),
+                makeRailPoint(along, normal, Math.max(footY + 0.2, topY)),
+                0.025,
+              );
+            }
+          });
+        });
+      }
+      staircaseCount += 1;
+    });
+  });
+  // Reconcile short perpendicular connector stairs with the true upper landing
+  // of a neighbouring tall flight. This runs after ALL stair profiles have been
+  // reconstructed so it can compare complete stair systems, but before the
+  // BufferGeometry is allocated. The same code therefore runs in maskOnly and
+  // visible passes and keeps Terrain/Pedestrian cutouts aligned with the final
+  // stair elevations.
+  let reconciledShortConnectorCount = 0;
+  const reconciledShortConnectorProfiles = [];
+  if (
+    reconcileShortConnectorStairs &&
+    renderedMaskProfiles.length >= 2
+  ) {
+    const sortedProfileCells = (profile) =>
+      (profile && Array.isArray(profile.treadCells)
+        ? profile.treadCells.filter(Boolean).slice()
+        : []
+      ).sort(
+        (a, b) =>
+          Number(a.treadIndex || 0) - Number(b.treadIndex || 0),
+      );
+    const getEndpoint = (profile, kind) => {
+      const cells = sortedProfileCells(profile);
+      if (!cells.length) return null;
+      const cell = kind === "bottom" ? cells[0] : cells[cells.length - 1];
+      const alongMin = Math.min(
+        Number(cell.alongMin),
+        Number(cell.alongMax),
+      );
+      const alongMax = Math.max(
+        Number(cell.alongMin),
+        Number(cell.alongMax),
+      );
+      const normalStart = Number(cell.normalStart);
+      const normalEnd = Number(cell.normalEnd);
+      const uxValue = Number(profile.ux);
+      const uzValue = Number(profile.uz);
+      const nxValue = Number(profile.nx);
+      const nzValue = Number(profile.nz);
+      if (
+        ![
+          alongMin,
+          alongMax,
+          normalStart,
+          normalEnd,
+          uxValue,
+          uzValue,
+          nxValue,
+          nzValue,
+        ].every(Number.isFinite)
+      ) {
+        return null;
+      }
+      const edgeNormal = kind === "bottom" ? normalStart : normalEnd;
+      const explicitY = Number(
+        kind === "bottom" ? profile.bottomLandingY : profile.topLandingY,
+      );
+      const stepHeight = Number(profile.sectionStepHeight);
+      const fallbackY =
+        kind === "bottom"
+          ? Number(cells[0].treadY)
+          : Number(cells[cells.length - 1].treadY) +
+            (Number.isFinite(stepHeight) ? stepHeight : 0);
+      const y = Number.isFinite(explicitY) ? explicitY : fallbackY;
+      if (!Number.isFinite(y)) return null;
+      const makePoint = (along) => ({
+        x: uxValue * along + nxValue * edgeNormal,
+        z: uzValue * along + nzValue * edgeNormal,
+      });
+      return {
+        kind,
+        y,
+        alongMin,
+        alongMax,
+        edgeNormal,
+        a: makePoint(alongMin),
+        b: makePoint(alongMax),
+      };
+    };
+    const pointSegmentDistance = (point, a, b) => {
+      const abX = Number(b.x) - Number(a.x);
+      const abZ = Number(b.z) - Number(a.z);
+      const apX = Number(point.x) - Number(a.x);
+      const apZ = Number(point.z) - Number(a.z);
+      const denominator = abX * abX + abZ * abZ;
+      const t =
+        denominator > 1e-9
+          ? clamp((apX * abX + apZ * abZ) / denominator, 0, 1)
+          : 0;
+      const nearestX = Number(a.x) + abX * t;
+      const nearestZ = Number(a.z) + abZ * t;
+      return Math.hypot(
+        Number(point.x) - nearestX,
+        Number(point.z) - nearestZ,
+      );
+    };
+    const segmentDistance = (first, second) =>
+      Math.min(
+        pointSegmentDistance(first.a, second.a, second.b),
+        pointSegmentDistance(first.b, second.a, second.b),
+        pointSegmentDistance(second.a, first.a, first.b),
+        pointSegmentDistance(second.b, first.a, first.b),
+      );
+    const profileStepCount = (profile) => {
+      const explicit = Number(
+        profile && (profile.Steps ?? profile.stepCount),
+      );
+      if (Number.isFinite(explicit)) return Math.round(explicit);
+      return sortedProfileCells(profile).length;
+    };
+    // A "tall" donor needs enough real treads that a nearby 3-step flight cannot
+    // accidentally snap to another tiny decorative/connector stair.
+    const tallProfiles = renderedMaskProfiles.filter(
+      (profile) => profileStepCount(profile) >= 6,
+    );
+    const shortProfiles = renderedMaskProfiles.filter(
+      (profile) => profileStepCount(profile) === 3,
+    );
+    const applyVerticalRemapToArray = (
+      values,
+      profile,
+      oldBottomY,
+      oldTopY,
+      newBottomY,
+      newTopY,
+      yLift = 0,
+    ) => {
+      if (!Array.isArray(values) || values.length < 3) return;
+      const uxValue = Number(profile.ux);
+      const uzValue = Number(profile.uz);
+      const nxValue = Number(profile.nx);
+      const nzValue = Number(profile.nz);
+      const alongMin = Number(profile.cutoutAlongMin);
+      const alongMax = Number(profile.cutoutAlongMax);
+      const normalMin = Number(profile.cutoutNormalMin);
+      const normalMax = Number(profile.cutoutNormalMax);
+      if (
+        ![
+          uxValue,
+          uzValue,
+          nxValue,
+          nzValue,
+          alongMin,
+          alongMax,
+          normalMin,
+          normalMax,
+          oldBottomY,
+          oldTopY,
+          newBottomY,
+          newTopY,
+        ].every(Number.isFinite)
+      ) {
+        return;
+      }
+      const oldRise = oldTopY - oldBottomY;
+      if (Math.abs(oldRise) < 1e-6) return;
+      const padding = 0.055;
+      for (let index = 0; index + 2 < values.length; index += 3) {
+        const x = Number(values[index]);
+        const rawY = Number(values[index + 1]);
+        const z = Number(values[index + 2]);
+        if (![x, rawY, z].every(Number.isFinite)) continue;
+        const along = x * uxValue + z * uzValue;
+        const normal = x * nxValue + z * nzValue;
+        if (
+          along < Math.min(alongMin, alongMax) - padding ||
+          along > Math.max(alongMin, alongMax) + padding ||
+          normal < Math.min(normalMin, normalMax) - padding ||
+          normal > Math.max(normalMin, normalMax) + padding
+        ) {
+          continue;
+        }
+        const baseY = rawY - yLift;
+        if (
+          baseY < Math.min(oldBottomY, oldTopY) - 0.09 ||
+          baseY > Math.max(oldBottomY, oldTopY) + 0.09
+        ) {
+          continue;
+        }
+        const fraction = (baseY - oldBottomY) / oldRise;
+        const mappedY =
+          newBottomY + (newTopY - newBottomY) * fraction;
+        values[index + 1] = mappedY + yLift;
+      }
+    };
+    const addSpatialLandingDeltaToPoint = (
+      point,
+      profile,
+      deltaBottom,
+      deltaTop,
+    ) => {
+      if (!point) return;
+      const uxValue = Number(profile.ux);
+      const uzValue = Number(profile.uz);
+      const nxValue = Number(profile.nx);
+      const nzValue = Number(profile.nz);
+      const cells = sortedProfileCells(profile);
+      if (!cells.length) return;
+      const first = cells[0];
+      const last = cells[cells.length - 1];
+      const normalStart = Number(first.normalStart);
+      const normalEnd = Number(last.normalEnd);
+      const along = Number(point.x) * uxValue + Number(point.z) * uzValue;
+      const normal =
+        Number(point.x) * nxValue + Number(point.z) * nzValue;
+      const alongMin = Number(profile.cutoutAlongMin);
+      const alongMax = Number(profile.cutoutAlongMax);
+      if (
+        ![
+          uxValue,
+          uzValue,
+          nxValue,
+          nzValue,
+          normalStart,
+          normalEnd,
+          along,
+          normal,
+          alongMin,
+          alongMax,
+          deltaBottom,
+          deltaTop,
+        ].every(Number.isFinite) ||
+        along < Math.min(alongMin, alongMax) - 0.12 ||
+        along > Math.max(alongMin, alongMax) + 0.12
+      ) {
+        return;
+      }
+      const denominator = normalEnd - normalStart;
+      const progress =
+        Math.abs(denominator) > 1e-6
+          ? clamp((normal - normalStart) / denominator, 0, 1)
+          : 0;
+      point.y =
+        Number(point.y) +
+        deltaBottom +
+        (deltaTop - deltaBottom) * progress;
+    };
+    shortProfiles.forEach((profile, shortIndex) => {
+      const cells = sortedProfileCells(profile);
+      if (!cells.length) return;
+      const bottomEndpoint = getEndpoint(profile, "bottom");
+      const topEndpoint = getEndpoint(profile, "top");
+      if (!bottomEndpoint || !topEndpoint) return;
+      const oldBottomY = Number(profile.bottomLandingY);
+      const oldTopY = Number(profile.topLandingY);
+      if (
+        ![oldBottomY, oldTopY].every(Number.isFinite) ||
+        oldTopY - oldBottomY < 0.08
+      ) {
+        return;
+      }
+      const riserCount = Math.max(
+        1,
+        Math.round(
+          Number(cells[0].sectionRiserCount) ||
+            Number(profile.stepCount) ||
+            Number(profile.Steps) ||
+            3,
+        ),
+      );
+      const getDonorCandidates = (endpoint, oldEndpointY, endpointKind) => {
+        const candidates = [];
+        tallProfiles.forEach((tallProfile, tallIndex) => {
+          if (tallProfile === profile) return;
+          const tallTop = getEndpoint(tallProfile, "top");
+          if (!tallTop) return;
+          const directionDot = Math.abs(
+            Number(profile.nx) * Number(tallProfile.nx) +
+              Number(profile.nz) * Number(tallProfile.nz),
+          );
+          if (!Number.isFinite(directionDot) || directionDot > 0.94) return;
+          const distance = segmentDistance(endpoint, tallTop);
+          if (!Number.isFinite(distance) || distance > 4.8) return;
+          const verticalCorrection = Math.abs(tallTop.y - oldEndpointY);
+          candidates.push({
+            endpointKind,
+            distance,
+            directionDot,
+            tallIndex,
+            tallProfile,
+            landingY: tallTop.y,
+            score:
+              distance * 10 +
+              verticalCorrection * 1.5 -
+              profileStepCount(tallProfile) * 0.01,
+          });
+        });
+        candidates.sort((a, b) => a.score - b.score);
+        return candidates.slice(0, 8);
+      };
+      const bottomCandidates = getDonorCandidates(
+        bottomEndpoint,
+        oldBottomY,
+        "bottom",
+      );
+      const topCandidates = getDonorCandidates(
+        topEndpoint,
+        oldTopY,
+        "top",
+      );
+      let best = null;
+      bottomCandidates.forEach((bottomDonor) => {
+        topCandidates.forEach((topDonor) => {
+          const candidateBottomY = Number(bottomDonor.landingY);
+          const candidateTopY = Number(topDonor.landingY);
+          const candidateRise = candidateTopY - candidateBottomY;
+          const candidateStepHeight = candidateRise / riserCount;
+          if (
+            !Number.isFinite(candidateRise) ||
+            candidateRise < 0.12 ||
+            !Number.isFinite(candidateStepHeight) ||
+            candidateStepHeight < 0.045 ||
+            candidateStepHeight > 0.38
+          ) {
+            return;
+          }
+          const sameDonorPenalty =
+            bottomDonor.tallIndex === topDonor.tallIndex ? 40 : 0;
+          const oldStepHeight =
+            (oldTopY - oldBottomY) / Math.max(1, riserCount);
+          const stepHeightPenalty =
+            Math.abs(candidateStepHeight - oldStepHeight) * 4;
+          const score =
+            bottomDonor.score +
+            topDonor.score +
+            sameDonorPenalty +
+            stepHeightPenalty;
+          if (!best || score < best.score) {
+            best = {
+              score,
+              kind: "both",
+              distance: Math.max(
+                bottomDonor.distance,
+                topDonor.distance,
+              ),
+              landingY: candidateTopY,
+              newBottomY: candidateBottomY,
+              newTopY: candidateTopY,
+              newStepHeight: candidateStepHeight,
+              bottomDonor,
+              topDonor,
+            };
+          }
+        });
+      });
+      if (!best) {
+        const singleCandidates = [
+          ...bottomCandidates.map((donor) => ({
+            donor,
+            kind: "bottom",
+            newBottomY: Number(donor.landingY),
+            newTopY: oldTopY,
+          })),
+          ...topCandidates.map((donor) => ({
+            donor,
+            kind: "top",
+            newBottomY: oldBottomY,
+            newTopY: Number(donor.landingY),
+          })),
+        ];
+        singleCandidates.forEach((candidate) => {
+          const candidateRise = candidate.newTopY - candidate.newBottomY;
+          const candidateStepHeight = candidateRise / riserCount;
+          if (
+            !Number.isFinite(candidateRise) ||
+            candidateRise < 0.12 ||
+            !Number.isFinite(candidateStepHeight) ||
+            candidateStepHeight < 0.045 ||
+            candidateStepHeight > 0.38
+          ) {
+            return;
+          }
+          const score = candidate.donor.score + 75;
+          if (!best || score < best.score) {
+            best = {
+              score,
+              kind: candidate.kind,
+              distance: candidate.donor.distance,
+              landingY: candidate.donor.landingY,
+              newBottomY: candidate.newBottomY,
+              newTopY: candidate.newTopY,
+              newStepHeight: candidateStepHeight,
+              bottomDonor:
+                candidate.kind === "bottom" ? candidate.donor : null,
+              topDonor: candidate.kind === "top" ? candidate.donor : null,
+            };
+          }
+        });
+      }
+      if (!best) return;
+      const deltaBottom = best.newBottomY - oldBottomY;
+      const deltaTop = best.newTopY - oldTopY;
+      if (
+        Math.abs(deltaBottom) <= 0.003 &&
+        Math.abs(deltaTop) <= 0.003
+      ) {
+        return;
+      }
+      applyVerticalRemapToArray(
+        positions,
+        profile,
+        oldBottomY,
+        oldTopY,
+        best.newBottomY,
+        best.newTopY,
+        0,
+      );
+      applyVerticalRemapToArray(
+        outlines,
+        profile,
+        oldBottomY,
+        oldTopY,
+        best.newBottomY,
+        best.newTopY,
+        Math.max(outlineLift, 0.012),
+      );
+      handrailSegments.forEach((segment) => {
+        addSpatialLandingDeltaToPoint(
+          segment && segment.a,
+          profile,
+          deltaBottom,
+          deltaTop,
+        );
+        addSpatialLandingDeltaToPoint(
+          segment && segment.b,
+          profile,
+          deltaBottom,
+          deltaTop,
+        );
+      });
+      const oldRise = oldTopY - oldBottomY;
+      const newRise = best.newTopY - best.newBottomY;
+      const verticalScale =
+        Math.abs(oldRise) > 1e-6 ? newRise / oldRise : 1;
+      cells.forEach((cell) => {
+        const oldTreadY = Number(cell.treadY);
+        if (Number.isFinite(oldTreadY)) {
+          cell.treadY =
+            best.newBottomY +
+            (oldTreadY - oldBottomY) * verticalScale;
+        }
+        cell.sectionStepHeight = best.newStepHeight;
+        cell.bottomLandingY = best.newBottomY;
+        cell.topLandingY = best.newTopY;
+      });
+      profile.sectionStepHeight = best.newStepHeight;
+      profile.bottomLandingY = best.newBottomY;
+      profile.topLandingY = best.newTopY;
+      if (Number.isFinite(Number(profile.handrailElevationSpan))) {
+        profile.handrailElevationSpan =
+          Number(profile.handrailElevationSpan) * verticalScale;
+      }
+      profile.shortConnectorLandingReconciled = true;
+      profile.shortConnectorLandingKind = best.kind;
+      profile.shortConnectorLandingDistance = best.distance;
+      profile.shortConnectorLandingY = best.landingY;
+      profile.shortConnectorBottomLandingY = best.newBottomY;
+      profile.shortConnectorTopLandingY = best.newTopY;
+      profile.shortConnectorBottomDonorIndex = best.bottomDonor
+        ? best.bottomDonor.tallIndex
+        : -1;
+      profile.shortConnectorTopDonorIndex = best.topDonor
+        ? best.topDonor.tallIndex
+        : -1;
+      profile.shortConnectorSourceStepCount = profileStepCount(profile);
+      profile.shortConnectorDonorStepCount = Math.max(
+        best.bottomDonor
+          ? profileStepCount(best.bottomDonor.tallProfile)
+          : 0,
+        best.topDonor ? profileStepCount(best.topDonor.tallProfile) : 0,
+      );
+      reconciledShortConnectorProfiles.push({
+        shortIndex,
+        kind: best.kind,
+        distance: best.distance,
+        landingY: best.landingY,
+        oldBottomY,
+        oldTopY,
+        newBottomY: best.newBottomY,
+        newTopY: best.newTopY,
+        newStepHeight: best.newStepHeight,
+        bottomDonorIndex: profile.shortConnectorBottomDonorIndex,
+        topDonorIndex: profile.shortConnectorTopDonorIndex,
+      });
+      reconciledShortConnectorCount += 1;
+    });
+  }
+  if (!maskOnly && positions.length) {
+    const geometry = new ThreeRef.BufferGeometry();
+    geometry.setAttribute(
+      "position",
+      new ThreeRef.Float32BufferAttribute(positions, 3),
+    );
+    geometry.computeVertexNormals();
+    const stairMaterial =
+      material && typeof material.clone === "function"
+        ? material.clone()
+        : material ||
+          new ThreeRef.MeshStandardMaterial({
+            color: 0xc8c5bb,
+            roughness: 0.9,
+            metalness: 0,
+            side: ThreeRef.DoubleSide,
+            polygonOffset: true,
+            polygonOffsetFactor: -2,
+            polygonOffsetUnits: -2,
+          });
+    // Even when a shared PATHS material is supplied, apply a small depth bias.
+    // This prevents Terrain (After) from visually swallowing coplanar treads.
+    if (stairMaterial) {
+      stairMaterial.polygonOffset = true;
+      stairMaterial.polygonOffsetFactor = -4;
+      stairMaterial.polygonOffsetUnits = -4;
+      stairMaterial.depthTest = true;
+      stairMaterial.depthWrite = true;
+    }
+    // Shared PATHS material is normally single-sided. Rendering both sides is
+    // important on the vertical risers and on stair runs seen from below.
+    if (stairMaterial && "side" in stairMaterial) {
+      stairMaterial.side = ThreeRef.DoubleSide;
+      stairMaterial.needsUpdate = true;
+    }
+    const mesh = new ThreeRef.Mesh(geometry, stairMaterial);
+    mesh.name = "stair-tread-surfaces";
+    mesh.renderOrder = 40;
+    mesh.frustumCulled = false;
+    group.add(mesh);
+  }
+  if (!maskOnly && outlines.length) {
+    const geometry = new ThreeRef.BufferGeometry();
+    geometry.setAttribute(
+      "position",
+      new ThreeRef.Float32BufferAttribute(outlines, 3),
+    );
+    // Use a dedicated stair-edge material instead of the generic PATHS line
+    // material. The generic material can be too faint against the pale treads.
+    const edgeMaterial = new ThreeRef.LineBasicMaterial({
+      color: 0x292722,
+      transparent: true,
+      opacity: 0.96,
+      toneMapped: false,
+      // Respect normal scene occlusion: stair edges must disappear behind
+      // terrain, trees, buildings and other opaque geometry.
+      depthTest: true,
+      depthWrite: false,
+    });
+    const lines = new ThreeRef.LineSegments(geometry, edgeMaterial);
+    lines.name = "stair-tread-edges";
+    lines.renderOrder = 48;
+    lines.frustumCulled = false;
+    group.add(lines);
+  }
+  if (!maskOnly && handrailSegments.length) {
+    const railGeometry = new ThreeRef.CylinderGeometry(1, 1, 1, 8, 1, false);
+    const railMaterial = new ThreeRef.MeshStandardMaterial({
+      // Match the authoritative Furniture & Equipment CAD handrails in Map.vue.
+      // Keeping both sources on one neutral grey avoids the old mixture of grey
+      // auto rails and purple/pink structure-line rails.
+      color: 0x9ea4a8,
+      roughness: 0.42,
+      metalness: 0.7,
+    });
+    const rails = new ThreeRef.InstancedMesh(
+      railGeometry,
+      railMaterial,
+      handrailSegments.length,
+    );
+    const dummy = new ThreeRef.Object3D();
+    const up = new ThreeRef.Vector3(0, 1, 0);
+    const start = new ThreeRef.Vector3();
+    const end = new ThreeRef.Vector3();
+    const direction = new ThreeRef.Vector3();
+    handrailSegments.forEach((segment, index) => {
+      start.set(segment.a.x, segment.a.y, segment.a.z);
+      end.set(segment.b.x, segment.b.y, segment.b.z);
+      direction.copy(end).sub(start);
+      const length = Math.max(0.01, direction.length());
+      dummy.position.copy(start).add(end).multiplyScalar(0.5);
+      dummy.quaternion.setFromUnitVectors(up, direction.normalize());
+      dummy.scale.set(segment.radius, length, segment.radius);
+      dummy.updateMatrix();
+      rails.setMatrixAt(index, dummy.matrix);
+    });
+    rails.instanceMatrix.needsUpdate = true;
+    rails.name = "stair-skatespot-handrails";
+    rails.renderOrder = 44;
+    rails.frustumCulled = false;
+    group.add(rails);
+  }
+  // Keep every CAD stair edge that did NOT contribute to a reconstructed
+  // tread visible as a diagnostic overlay. This includes isolated edges and
+  // fragmented/disjoint edges inside a cluster. They are never converted into
+  // fake slabs; they remain true source geometry only.
+  const orphanPositions = [];
+  segments.forEach((segment, segmentIndex) => {
+    if (
+      renderedSegmentIds.has(segmentIndex) ||
+      suppressedSegmentIds.has(segmentIndex)
+    )
+      return;
+    const aTerrain = Number(getTerrainHeight(segment.a));
+    const bTerrain = Number(getTerrainHeight(segment.b));
+    const ay = (Number.isFinite(aTerrain) ? aTerrain : 0) + clearance + 0.09;
+    const by = (Number.isFinite(bTerrain) ? bTerrain : 0) + clearance + 0.09;
+    orphanPositions.push(
+      segment.a.x,
+      ay,
+      segment.a.z,
+      segment.b.x,
+      by,
+      segment.b.z,
+    );
+  });
+  if (!maskOnly && orphanPositions.length) {
+    const orphanGeometry = new ThreeRef.BufferGeometry();
+    orphanGeometry.setAttribute(
+      "position",
+      new ThreeRef.Float32BufferAttribute(orphanPositions, 3),
+    );
+    const orphanMaterial = new ThreeRef.LineBasicMaterial({
+      color: 0x53504a,
+      transparent: true,
+      opacity: 0.72,
+      // Diagnostic CAD edges should also respect normal scene occlusion.
+      depthTest: true,
+      depthWrite: false,
+    });
+    const orphanLines = new ThreeRef.LineSegments(
+      orphanGeometry,
+      orphanMaterial,
+    );
+    orphanLines.name = "stair-source-edges-not-rendered";
+    orphanLines.renderOrder = 42;
+    orphanLines.frustumCulled = false;
+    group.add(orphanLines);
+  }
+  // IMPORTANT: this is the authoritative visual footprint used by Map.vue for
+  // BOTH Terrain (After) and every PATHS surface. It is derived from emitted
+  // treads, so masking can no longer drift away from the visible staircase.
+  group.userData.stairSurfaceCutoutProfiles = renderedMaskProfiles;
+  group.userData.stairCount = staircaseCount;
+  group.userData.treadCount = treadCount;
+  group.userData.reconciledShortConnectorCount =
+    reconciledShortConnectorCount;
+  group.userData.reconciledShortConnectorProfiles =
+    reconciledShortConnectorProfiles;
+  group.userData.handrailSegmentCount = handrailSegments.length;
+  group.userData.segmentCount = segments.length;
+  group.userData.clusteredSegmentCount = clusteredSegmentIds.size;
+  group.userData.renderedSourceSegmentCount = renderedSegmentIds.size;
+  group.userData.suppressedWaterCrossingStairSegmentCount =
+    suppressedSegmentIds.size;
+  group.userData.unrenderedSourceSegmentCount = Math.max(
+    0,
+    segments.length - renderedSegmentIds.size,
+  );
+  return group;
+}
+/**
+ * Creates the first Three.js milestone layer for Mapbox.
+ *
+ * The temporary cyan platform proves that Three.js is correctly sharing the
+ * Mapbox canvas, camera, WebGL context, depth buffer, and geographic position.
+ * Replace this platform later with the selected park's clipped terrain mesh.
+ *
+ * @param {object} options
+ * @param {object} options.mapboxgl Loaded Mapbox GL JS object.
+ * @param {[number, number]} options.origin [longitude, latitude].
+ * @param {number} [options.altitude=0] Altitude in meters.
+ * @returns {object} Mapbox CustomLayerInterface implementation.
+ */
+export function createThreeParkLayer({
+  mapboxgl,
+  origin,
+  altitude = 0,
+}) {
+  if (!mapboxgl || !mapboxgl.MercatorCoordinate) {
+    throw new Error("A loaded Mapbox GL JS object is required.");
+  }
+  if (
+    !Array.isArray(origin) ||
+    origin.length < 2 ||
+    !Number.isFinite(Number(origin[0])) ||
+    !Number.isFinite(Number(origin[1]))
+  ) {
+    throw new Error(
+      "createThreeParkLayer requires origin as [longitude, latitude].",
+    );
+  }
+  const longitude = Number(origin[0]);
+  const latitude = Number(origin[1]);
+  const modelAltitude = Number.isFinite(Number(altitude))
+    ? Number(altitude)
+    : 0;
+  const mercatorOrigin = mapboxgl.MercatorCoordinate.fromLngLat(
+    { lng: longitude, lat: latitude },
+    modelAltitude,
+  );
+  const modelTransform = {
+    translateX: mercatorOrigin.x,
+    translateY: mercatorOrigin.y,
+    translateZ: mercatorOrigin.z,
+    scale: mercatorOrigin.meterInMercatorCoordinateUnits(),
+    rotateX: Math.PI / 2,
+    rotateY: 0,
+    rotateZ: 0,
+  };
+  return {
+    id: THREE_PARK_LAYER_ID,
+    type: "custom",
+    renderingMode: "3d",
+    onAdd(map, gl) {
+      this.map = map;
+      this.camera = new THREE.Camera();
+      this.scene = new THREE.Scene();
+      this.root = new THREE.Group();
+      // Temporary 120 m × 120 m × 8 m cyan terrain block.
+      const platformGeometry = new THREE.BoxGeometry(120, 8, 120);
+      const platformMaterial = new THREE.MeshBasicMaterial({
+        color: 0x00d9ff,
+        transparent: true,
+        opacity: 0.14,
+        depthWrite: false,
+      });
+      const platform = new THREE.Mesh(platformGeometry, platformMaterial);
+      platform.position.y = 4;
+      const platformEdgeGeometry = new THREE.EdgesGeometry(platformGeometry);
+      const platformEdgeMaterial = new THREE.LineBasicMaterial({
+        color: 0x73faff,
+        transparent: true,
+        opacity: 0.98,
+      });
+      const platformEdges = new THREE.LineSegments(
+        platformEdgeGeometry,
+        platformEdgeMaterial,
+      );
+      platformEdges.position.copy(platform.position);
+      // Temporary wireframe pavilion to make rotation and scale easy to verify.
+      const pavilionGeometry = new THREE.CylinderGeometry(
+        16,
+        16,
+        24,
+        8,
+        1,
+        true,
+      );
+      const pavilionMaterial = new THREE.MeshBasicMaterial({
+        color: 0x9bfbff,
+        wireframe: true,
+        transparent: true,
+        opacity: 0.95,
+      });
+      const pavilion = new THREE.Mesh(
+        pavilionGeometry,
+        pavilionMaterial,
+      );
+      pavilion.position.y = 16;
+      const grid = new THREE.GridHelper(120, 20, 0x73faff, 0x17616b);
+      grid.position.y = 8.05;
+      this.root.add(platform);
+      this.root.add(platformEdges);
+      this.root.add(grid);
+      this.root.add(pavilion);
+      this.scene.add(this.root);
+      // Share Mapbox's existing canvas and WebGL context.
+      this.renderer = new THREE.WebGLRenderer({
+        canvas: map.getCanvas(),
+        context: gl,
+        antialias: true,
+      });
+      this.renderer.autoClear = false;
+      if (typeof map.triggerRepaint === "function") {
+        map.triggerRepaint();
+      }
+    },
+    render(gl, matrix) {
+      const rotationX = new THREE.Matrix4().makeRotationAxis(
+        new THREE.Vector3(1, 0, 0),
+        modelTransform.rotateX,
+      );
+      const rotationY = new THREE.Matrix4().makeRotationAxis(
+        new THREE.Vector3(0, 1, 0),
+        modelTransform.rotateY,
+      );
+      const rotationZ = new THREE.Matrix4().makeRotationAxis(
+        new THREE.Vector3(0, 0, 1),
+        modelTransform.rotateZ,
+      );
+      const mapMatrix = new THREE.Matrix4().fromArray(matrix);
+      const localMatrix = new THREE.Matrix4()
+        .makeTranslation(
+          modelTransform.translateX,
+          modelTransform.translateY,
+          modelTransform.translateZ,
+        )
+        .scale(
+          new THREE.Vector3(
+            modelTransform.scale,
+            -modelTransform.scale,
+            modelTransform.scale,
+          ),
+        )
+        .multiply(rotationX)
+        .multiply(rotationY)
+        .multiply(rotationZ);
+      this.camera.projectionMatrix = mapMatrix.multiply(localMatrix);
+      this.renderer.resetState();
+      this.renderer.render(this.scene, this.camera);
+    },
+    onRemove() {
+      disposeThreeObject(this.scene);
+      if (this.renderer) {
+        this.renderer.dispose();
+      }
+      this.root = null;
+      this.scene = null;
+      this.camera = null;
+      this.renderer = null;
+      this.map = null;
+    },
+  };
+}
